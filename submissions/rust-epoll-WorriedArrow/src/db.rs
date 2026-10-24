@@ -78,6 +78,8 @@ pub struct UserOut {
 }
 
 pub static READS: Queue<ReadJob> = Queue::new();
+/// Held by the read lane that is currently forming a batch.
+static GATHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub static WRITES: Queue<WriteJob> = Queue::new();
 pub static BCRYPT: Queue<BcryptJob> = Queue::new();
 
@@ -85,6 +87,8 @@ pub struct Settings {
     pub cfg: pg::Config,
     pub keys: &'static crate::jwt::Keys,
     pub read_batch: usize,
+    pub read_min: usize,
+    pub read_window: Duration,
     pub write_batch: usize,
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
@@ -264,7 +268,13 @@ impl ReadLane {
         let mut jobs = Vec::with_capacity(self.s.read_batch);
         loop {
             jobs.clear();
-            READS.take(self.s.read_batch, &mut jobs);
+            {
+                // Lanes take turns forming batches: one lane collects (up to the window, or until the batch is big
+                // enough) while the others execute theirs. Batches stay large at any load instead of being whatever
+                // trickled in since the last lane freed up.
+                let _turn = GATHER.lock().unwrap();
+                READS.take_window(self.s.read_min, self.s.read_window, self.s.read_batch, &mut jobs);
+            }
             let batch = std::mem::take(&mut jobs);
             let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
             if let Err(e) = self.batch(batch) {

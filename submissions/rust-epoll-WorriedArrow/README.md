@@ -34,8 +34,12 @@ shared queue, of every endpoint, and answers the whole batch in two pipelined ro
    once per batch instead of once per request. The per-viewer `favorited` / `following` flags are one primary-key
    range scan per viewer (`= ANY(...)`) instead of a probe per article.
 
-When the server is idle a batch is one request. As load rises, the queue grows while lanes are busy, batches grow
-with it, and each batch shares more work, so Postgres CPU per request goes *down* as load goes up.
+**The batch clock.** Lanes take turns forming batches: one lane collects requests for up to 20 ms while the others
+execute theirs, so batches are large at any load instead of being whatever trickled in since the last lane freed up.
+Postgres pays a fixed cost per statement execution, and a batch of a few hundred requests splits it a few hundred ways;
+everything requests have in common (the newest page, the tag list, a viral article's favorite count and comment
+thread) is read once per batch instead of once per request. On an 8-vCPU box at 50,000 users this took the server
+plus Postgres from 66% to 23% CPU, for about 50 ms of added latency.
 
 Nothing outlives its batch: every value in a response was read from Postgres while that request was waiting, and
 only requests already queued when the batch started share it.
@@ -72,7 +76,9 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | 6 | hashes run in lockstep |
 | `BCRYPT_WINDOW_MS` | 400 | how long the first bcrypt thread waits to fill its lanes |
-| `READ_BATCH`, `WRITE_BATCH` | 512, 256 | batch size caps |
+| `READ_WINDOW_US` | 20000 | how long a lane collects a read batch |
+| `READ_MIN` | 100000 | a batch this large is taken before the window ends |
+| `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 
 Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
 
