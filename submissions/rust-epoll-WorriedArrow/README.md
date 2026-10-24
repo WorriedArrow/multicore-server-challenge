@@ -47,8 +47,14 @@ the others. A write whose commit outcome is unknown (connection lost) is never r
 (favorite, create, update) read it through the read lanes after the commit, in a new snapshot.
 
 **bcrypt** runs on its own threads, several hashes in lockstep: a single bcrypt is one long chain of dependent S-box
-loads, and interleaving independent hashes lets the core overlap them (about 3.4x throughput at 6 lanes). Every hash
-still does all 2^10 rounds; logins always verify against the stored hash.
+loads, and interleaving independent hashes lets the core overlap them (about 3.4x throughput at 6 lanes). One worker
+waits up to 400 ms for its six lanes to fill; a second worker only takes full sets, so a steady trickle of logins
+isn't split into half-empty runs. Every hash still does all 2^10 rounds; logins always verify against the stored hash.
+
+**Postgres session settings** (startup parameters on its own connections, nothing server-wide):
+`plan_cache_mode = force_generic_plan`, because with the default the array-parameter statements were re-planned on
+every execution (16% of Postgres CPU in a profile), and `jit = off`, because a generic plan can't see LIMIT values or
+array sizes, its cost estimate crosses `jit_above_cost`, and compiling took milliseconds per sub-millisecond statement.
 
 **HTTP**: one epoll thread per `SO_REUSEPORT` listener. Reads go through a per-thread scratch buffer, so an idle
 keep-alive connection holds no buffers, only its slot. Responses go out with one `writev` when the socket accepts it.
@@ -63,9 +69,9 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `IO_THREADS` | cores / 4 | epoll threads |
 | `READ_LANES` | cores | read connections |
 | `WRITE_LANES` | 1 | group-commit connections |
-| `BCRYPT_THREADS` | cores / 4 | bcrypt threads |
+| `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | 6 | hashes run in lockstep |
-| `BCRYPT_WINDOW_MS` | 120 | how long a bcrypt thread waits to fill its lanes |
+| `BCRYPT_WINDOW_MS` | 400 | how long the first bcrypt thread waits to fill its lanes |
 | `READ_BATCH`, `WRITE_BATCH` | 512, 256 | batch size caps |
 
 Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
