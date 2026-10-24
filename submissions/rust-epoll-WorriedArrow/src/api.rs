@@ -31,8 +31,17 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decodes; `plus` also turns '+' into ' ' (query strings). Invalid escapes give None.
+/// Percent-decodes; `plus` also turns '+' into ' ' (query strings). Invalid escapes, invalid UTF-8 and NUL (which
+/// Postgres text can't hold, so it can't match anything) give None.
 fn unescape(s: &[u8], plus: bool) -> Option<String> {
+    let s = unescape_raw(s, plus)?;
+    if s.contains('\0') {
+        return None;
+    }
+    Some(s)
+}
+
+fn unescape_raw(s: &[u8], plus: bool) -> Option<String> {
     if !s.iter().any(|&b| b == b'%' || (plus && b == b'+')) {
         return String::from_utf8(s.to_vec()).ok();
     }
@@ -67,6 +76,8 @@ struct Query {
     tag: Option<String>,
     author: Option<String>,
     favorited: Option<String>,
+    /// A tag/author/favorited value that can't match any row (NUL or invalid UTF-8).
+    unmatchable: bool,
 }
 
 fn parse_query(q: &[u8]) -> Query {
@@ -80,16 +91,24 @@ fn parse_query(q: &[u8]) -> Query {
             None => (part, &b""[..]),
         };
         let Some(k) = unescape(k, true) else { continue };
-        let slot = match k.as_str() {
-            "limit" => &mut out.limit,
-            "offset" => &mut out.offset,
-            "tag" => &mut out.tag,
-            "author" => &mut out.author,
-            "favorited" => &mut out.favorited,
+        let (slot, filter) = match k.as_str() {
+            "limit" => (&mut out.limit, false),
+            "offset" => (&mut out.offset, false),
+            "tag" => (&mut out.tag, true),
+            "author" => (&mut out.author, true),
+            "favorited" => (&mut out.favorited, true),
             _ => continue,
         };
         if slot.is_none() {
-            *slot = Some(unescape(v, true).unwrap_or_default());
+            match unescape(v, true) {
+                Some(v) => *slot = Some(v),
+                None if filter => {
+                    *slot = Some(String::new());
+                    out.unmatchable = true;
+                }
+                // limit/offset: not a number -> 422
+                None => *slot = Some("x".into()),
+            }
         }
     }
     out
@@ -110,7 +129,8 @@ fn limit_offset(q: &Query) -> Option<(i64, i64)> {
         lim = parse_uint(l).filter(|n| (1..=100).contains(n))?;
     }
     if let Some(o) = &q.offset {
-        off = parse_uint(o)?;
+        // Past any real row count either way; capped so `limit + offset` can't overflow bigint in SQL.
+        off = parse_uint(o)?.min(i64::MAX / 2);
     }
     Some((lim, off))
 }
@@ -124,6 +144,28 @@ fn wrapper(body: &[u8], key: &str) -> Option<serde_json::Map<String, Value>> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// True if any string in the object (or its arrays) contains NUL, which Postgres text can't store.
+fn has_nul(m: &serde_json::Map<String, Value>) -> bool {
+    fn v(x: &Value) -> bool {
+        match x {
+            Value::String(s) => s.contains('\0'),
+            Value::Array(a) => a.iter().any(v),
+            Value::Object(o) => o.values().any(v),
+            _ => false,
+        }
+    }
+    m.values().any(v)
+}
+
+/// A request body object whose strings Postgres can store.
+fn body_obj(body: &[u8], key: &str) -> Result<serde_json::Map<String, Value>, Outcome> {
+    match wrapper(body, key) {
+        Some(m) if has_nul(&m) => Err(err(422, "strings must not contain NUL")),
+        Some(m) => Ok(m),
+        None => Err(err(422, "invalid body")),
     }
 }
 
@@ -238,7 +280,7 @@ pub fn handle(keys: &crate::jwt::Keys, r: &Request, to: ReplyTo) -> Outcome {
         (b"POST", [b"articles", s, b"comments"]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
             required(&|v, _| {
-                let Some(c) = wrapper(r.body, "comment") else { return err(422, "invalid body") };
+                let c = match body_obj(r.body, "comment") { Ok(c) => c, Err(e) => return e };
                 match req_string(&c, "body") {
                     Ok(body) => write(Write::CreateComment { slug: slug.clone(), body }, v, to),
                     Err(()) => err(422, "body is required"),
@@ -260,6 +302,9 @@ pub fn handle(keys: &crate::jwt::Keys, r: &Request, to: ReplyTo) -> Outcome {
 fn list(query: &[u8], v: i64, to: ReplyTo) -> Outcome {
     let q = parse_query(query);
     let Some((lim, off)) = limit_offset(&q) else { return err(422, "limit must be 1-100 and offset >= 0") };
+    if q.unmatchable {
+        return Outcome::Now(200, b"{\"articles\":[],\"articlesCount\":0}".to_vec());
+    }
     let nonempty = |s: &Option<String>| s.as_ref().filter(|s| !s.is_empty()).cloned();
     let kind = if let Some(tag) = nonempty(&q.tag) {
         Read::Tag { tag, lim, off }
@@ -274,7 +319,7 @@ fn list(query: &[u8], v: i64, to: ReplyTo) -> Outcome {
 }
 
 fn register(body: &[u8], to: ReplyTo) -> Outcome {
-    let Some(m) = wrapper(body, "user") else { return err(422, "invalid body") };
+    let m = match body_obj(body, "user") { Ok(m) => m, Err(e) => return e };
     let (Ok(username), Ok(email), Ok(password)) = (req_string(&m, "username"), req_string(&m, "email"), req_string(&m, "password"))
     else {
         return err(422, "username, email and password are required");
@@ -292,15 +337,15 @@ fn login(body: &[u8], to: ReplyTo) -> Outcome {
     let (Ok(email), Ok(password)) = (req_string(&m, "email"), req_string(&m, "password")) else {
         return err(422, "email and password are required");
     };
-    if password.len() > MAX_PASSWORD {
-        // bcrypt cannot match a password this long
+    // No stored email contains NUL (Postgres text can't), and bcrypt cannot match a password this long.
+    if email.contains('\0') || password.len() > MAX_PASSWORD {
         return err(401, "invalid email or password");
     }
     read(Read::Login { email, password: password.into_bytes() }, 0, to)
 }
 
 fn update_user(body: &[u8], id: i64, token: String, to: ReplyTo) -> Outcome {
-    let Some(m) = wrapper(body, "user") else { return err(422, "invalid body") };
+    let m = match body_obj(body, "user") { Ok(m) => m, Err(e) => return e };
     let (Ok(email), Ok(username), Ok(password), Ok(bio), Ok(image)) = (
         opt_string(&m, "email", true),
         opt_string(&m, "username", true),
@@ -322,7 +367,7 @@ fn update_user(body: &[u8], id: i64, token: String, to: ReplyTo) -> Outcome {
 }
 
 fn create_article(body: &[u8], v: i64, to: ReplyTo) -> Outcome {
-    let Some(m) = wrapper(body, "article") else { return err(422, "invalid body") };
+    let m = match body_obj(body, "article") { Ok(m) => m, Err(e) => return e };
     let (Ok(title), Ok(description), Ok(body)) = (req_string(&m, "title"), req_string(&m, "description"), req_string(&m, "body"))
     else {
         return err(422, "title, description and body are required");
@@ -344,7 +389,7 @@ fn create_article(body: &[u8], v: i64, to: ReplyTo) -> Outcome {
 }
 
 fn update_article(body: &[u8], slug: String, v: i64, to: ReplyTo) -> Outcome {
-    let Some(m) = wrapper(body, "article") else { return err(422, "invalid body") };
+    let m = match body_obj(body, "article") { Ok(m) => m, Err(e) => return e };
     let (Ok(title), Ok(description), Ok(body)) =
         (opt_string(&m, "title", true), opt_string(&m, "description", true), opt_string(&m, "body", true))
     else {
