@@ -1,9 +1,39 @@
 //! JSON output helpers and timestamp formatting.
 
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// True if any byte of the 8 needs escaping: < 0x20, '"' or '\\' (SWAR: a zero byte after XOR, or a borrow
+/// below 0x20, sets that byte's high bit; bytes >= 0x80 are excluded so UTF-8 passes through).
+#[inline(always)]
+fn needs_escape(w: u64) -> bool {
+    let quote = w ^ (LO * b'"' as u64);
+    let bslash = w ^ (LO * b'\\' as u64);
+    let t = (w.wrapping_sub(LO * 0x20)) | quote.wrapping_sub(LO) & !quote | bslash.wrapping_sub(LO) & !bslash;
+    t & !w & HI != 0
+}
+
 /// Appends `s` as a JSON string literal (with quotes).
 #[inline]
 pub fn str(out: &mut Vec<u8>, s: &[u8]) {
+    out.reserve(s.len() + 2);
     out.push(b'"');
+    // Fast path: copy 8-byte words that need no escaping.
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if needs_escape(w) {
+            break;
+        }
+        i += 8;
+    }
+    if i == s.len() {
+        out.extend_from_slice(s);
+        out.push(b'"');
+        return;
+    }
+    out.extend_from_slice(&s[..i]);
+    let s = &s[i..];
     let mut start = 0;
     for (i, &b) in s.iter().enumerate() {
         let esc: &[u8] = match b {
@@ -122,6 +152,44 @@ mod tests {
         super::ts(&mut o, -1);
         assert_eq!(o, b"\"1999-12-31T23:59:59.999Z\"");
     }
+    /// The word-at-a-time path must agree with a byte-by-byte reference on every input.
+    #[test]
+    fn escapes_match_reference() {
+        fn reference(s: &[u8]) -> Vec<u8> {
+            let mut o = vec![b'"'];
+            for &b in s {
+                match b {
+                    b'"' => o.extend_from_slice(b"\\\""),
+                    b'\\' => o.extend_from_slice(b"\\\\"),
+                    b'\n' => o.extend_from_slice(b"\\n"),
+                    b'\r' => o.extend_from_slice(b"\\r"),
+                    b'\t' => o.extend_from_slice(b"\\t"),
+                    0..=0x1f => o.extend_from_slice(format!("\\u{:04x}", b).as_bytes()),
+                    _ => o.push(b),
+                }
+            }
+            o.push(b'"');
+            o
+        }
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for len in 0..80 {
+            for _ in 0..300 {
+                let s: Vec<u8> = (0..len)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let pick = [b'a', b' ', b'"', b'\\', 0x01, 0x1f, 0x20, 0x7f, 0x80, 0xc3, 0xa9, 0xff, b'\n'];
+                        if x % 4 == 0 { pick[(x >> 8) as usize % pick.len()] } else { b'a' + (x >> 16) as u8 % 26 }
+                    })
+                    .collect();
+                let mut o = Vec::new();
+                super::str(&mut o, &s);
+                assert_eq!(o, reference(&s), "{s:?}");
+            }
+        }
+    }
+
     #[test]
     fn escapes() {
         let mut o = Vec::new();

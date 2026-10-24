@@ -283,7 +283,7 @@ fn register(body: &[u8], to: ReplyTo) -> Outcome {
         return err(422, "password is too long");
     }
     let write = WriteJob { kind: Write::Register { username, email, hash: String::new() }, viewer: 0, to };
-    db::BCRYPT.push(BcryptJob::Hash { password: password.into_bytes(), write });
+    db::BCRYPT.push_all(BcryptJob::Hash { password: password.into_bytes(), write });
     Outcome::Queued
 }
 
@@ -314,7 +314,7 @@ fn update_user(body: &[u8], id: i64, token: String, to: ReplyTo) -> Outcome {
     match password {
         Some(p) if p.len() > MAX_PASSWORD => err(422, "password is too long"),
         Some(p) => {
-            db::BCRYPT.push(BcryptJob::Hash { password: p.into_bytes(), write: WriteJob { kind, viewer: id, to } });
+            db::BCRYPT.push_all(BcryptJob::Hash { password: p.into_bytes(), write: WriteJob { kind, viewer: id, to } });
             Outcome::Queued
         }
         None => write(kind, id, to),

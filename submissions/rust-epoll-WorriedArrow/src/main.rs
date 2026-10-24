@@ -29,7 +29,7 @@ fn main() {
     let io_threads: usize = env_or("IO_THREADS", (cpus / 4).max(1));
     let read_lanes: usize = env_or("READ_LANES", cpus.max(2));
     let write_lanes: usize = env_or("WRITE_LANES", 1);
-    let bcrypt_threads: usize = env_or("BCRYPT_THREADS", (cpus / 4).max(1));
+    let bcrypt_threads: usize = env_or("BCRYPT_THREADS", 2);
 
     let keys: &'static jwt::Keys = Box::leak(Box::new(jwt::Keys::new(secret.as_bytes())));
     let settings: &'static db::Settings = Box::leak(Box::new(db::Settings {
@@ -38,7 +38,7 @@ fn main() {
         read_batch: env_or("READ_BATCH", 512),
         write_batch: env_or("WRITE_BATCH", 256),
         bcrypt_lanes: env_or::<usize>("BCRYPT_LANES", 6).clamp(1, 6),
-        bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 120)),
+        bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
     }));
 
     // Fail fast if Postgres is unreachable or a statement doesn't prepare.
@@ -60,8 +60,8 @@ fn main() {
         let lane = db::WriteLane::new(settings);
         std::thread::Builder::new().name("write".into()).spawn(move || lane.run()).unwrap();
     }
-    for _ in 0..bcrypt_threads {
-        std::thread::Builder::new().name("bcrypt".into()).spawn(move || db::bcrypt_worker(settings)).unwrap();
+    for i in 0..bcrypt_threads {
+        std::thread::Builder::new().name("bcrypt".into()).spawn(move || db::bcrypt_worker(settings, i)).unwrap();
     }
     let mut handles = Vec::new();
     for t in 0..io_threads {

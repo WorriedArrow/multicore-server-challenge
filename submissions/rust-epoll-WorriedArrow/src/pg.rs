@@ -327,7 +327,18 @@ impl Conn {
         let mut m = Vec::new();
         m.extend_from_slice(&0i32.to_be_bytes());
         m.extend_from_slice(&196608i32.to_be_bytes());
-        for (k, v) in [("user", cfg.user.as_str()), ("database", cfg.dbname.as_str()), ("client_encoding", "UTF8"), ("DateStyle", "ISO")] {
+        // Session settings only. plan_cache_mode: every statement here takes arrays of a batch's keys, and the default
+        // ("auto") keeps re-planning them per execution because a custom plan looks cheaper for each array. jit: a
+        // generic plan can't see LIMIT values or array sizes, its cost estimate crosses jit_above_cost, and compiling
+        // costs milliseconds per execution of a sub-millisecond statement.
+        for (k, v) in [
+            ("user", cfg.user.as_str()),
+            ("database", cfg.dbname.as_str()),
+            ("client_encoding", "UTF8"),
+            ("DateStyle", "ISO"),
+            ("plan_cache_mode", "force_generic_plan"),
+            ("jit", "off"),
+        ] {
             m.extend_from_slice(k.as_bytes());
             m.push(0);
             m.extend_from_slice(v.as_bytes());

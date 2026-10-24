@@ -628,7 +628,7 @@ impl ReadLane {
                                 image: owned(&pa, r[5]),
                             };
                             let hash = owned(&pa, r[6]).unwrap_or_default();
-                            BCRYPT.push(BcryptJob::Verify { password, hash, user, to });
+                            BCRYPT.push_all(BcryptJob::Verify { password, hash, user, to });
                         }
                         None => out.push(reply::error(to, 401, "invalid email or password")),
                     }
@@ -1057,15 +1057,20 @@ fn finish_write(j: WriteJob, p: &Pipeline, start: usize, k: usize, s: &Settings,
 // ------------------------------------------------------------------------------------------------------------------
 // bcrypt workers
 
-pub fn bcrypt_worker(s: &'static Settings) {
+/// Worker 0 waits up to the window to fill its lanes, then runs what it has. Other workers only take full sets of
+/// lanes, so they add capacity under a backlog without splitting the trickle of logins into half-empty runs.
+pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
         jobs.clear();
-        BCRYPT.take_gather(s.bcrypt_lanes, s.bcrypt_window, &mut jobs);
+        if index == 0 {
+            BCRYPT.take_gather(s.bcrypt_lanes, s.bcrypt_window, &mut jobs);
+        } else {
+            BCRYPT.take_full(s.bcrypt_lanes, &mut jobs);
+        }
         let mut batch = std::mem::take(&mut jobs);
         // Hashes of another cost (not produced by this server) run on their own.
         let mut odd: Vec<BcryptJob> = Vec::new();
-        batch.retain_mut(|_| true);
         let mut i = 0;
         while i < batch.len() {
             let c = match &batch[i] {

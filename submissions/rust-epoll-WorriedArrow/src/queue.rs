@@ -20,6 +20,12 @@ impl<T> Queue<T> {
         self.cv.notify_one();
     }
 
+    /// Push and wake every waiter (for queues whose consumers wait on different conditions).
+    pub fn push_all(&self, item: T) {
+        self.q.lock().unwrap().push_back(item);
+        self.cv.notify_all();
+    }
+
     /// Blocks until at least one item is queued, then takes up to `max`.
     pub fn take(&self, max: usize, out: &mut Vec<T>) {
         let mut q = self.q.lock().unwrap();
@@ -30,6 +36,18 @@ impl<T> Queue<T> {
         out.extend(q.drain(..n));
         if !q.is_empty() {
             self.cv.notify_one();
+        }
+    }
+
+    /// Blocks until at least `want` items are queued, then takes `want`.
+    pub fn take_full(&self, want: usize, out: &mut Vec<T>) {
+        let mut q = self.q.lock().unwrap();
+        while q.len() < want {
+            q = self.cv.wait(q).unwrap();
+        }
+        out.extend(q.drain(..want));
+        if !q.is_empty() {
+            self.cv.notify_all();
         }
     }
 
