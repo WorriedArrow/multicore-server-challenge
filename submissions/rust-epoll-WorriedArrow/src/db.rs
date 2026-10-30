@@ -310,7 +310,16 @@ impl ReadLane {
             let n = jobs.len() as u64;
             let prev = self.pool.batch_len.load(Relaxed);
             self.pool.batch_len.store(if prev == 0 { n } else { (prev * 7 + n) / 8 }, Relaxed);
-            let batch = std::mem::take(&mut jobs);
+            let mut batch = std::mem::take(&mut jobs);
+            // Clients that hung up while queued (a load generator's timeout, say) get no database work.
+            if batch.iter().any(|j| !reply::alive(j.to)) {
+                let (live, gone): (Vec<ReadJob>, Vec<ReadJob>) = batch.into_iter().partition(|j| reply::alive(j.to));
+                reply::send_all(gone.into_iter().map(|j| reply::error(j.to, 503, "client gone")).collect());
+                batch = live;
+                if batch.is_empty() {
+                    continue;
+                }
+            }
             let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
             let res = self.batch(batch);
             if let Err(e) = res {
@@ -1272,6 +1281,14 @@ pub fn bcrypt_rescue(s: &'static Settings) {
 }
 
 fn run_bcrypt(jobs: Vec<BcryptJob>, s: &Settings, cost: u32) {
+    // A login whose client hung up isn't worth a hash.
+    let (jobs, gone): (Vec<BcryptJob>, Vec<BcryptJob>) =
+        jobs.into_iter().partition(|j| !matches!(j, BcryptJob::Verify { to, .. } if !reply::alive(*to)));
+    for j in gone {
+        if let BcryptJob::Verify { to, .. } = j {
+            reply::send(to, 503, reply::error_body("client gone"));
+        }
+    }
     if jobs.is_empty() {
         return;
     }

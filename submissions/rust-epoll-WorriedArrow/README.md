@@ -88,7 +88,13 @@ each wakeup can preempt a busy Postgres backend; batch threads get the same CPU 
 **Fewer packets**: after each response the server leaves TCP quick-ack mode on that socket, so the ACK for the
 client's next request rides on the response to it instead of going out as a packet of its own.
 
-**HTTP**: one epoll thread per `SO_REUSEPORT` listener. Reads go through a per-thread scratch buffer, so an idle
+**Clients that hung up** while their request was queued (a load generator's timeout, say) cost nothing more: each
+IO thread publishes, per connection slot, which request generation can still be answered, and read lanes and
+bcrypt skip jobs whose client is gone.
+
+**HTTP**: one epoll thread per `SO_REUSEPORT` listener, each with a descriptor table of its own (`unshare(CLONE_FILES)`
+at start): client sockets are only touched by the thread that accepted them, so the kernel skips the shared table's
+locking and reference counting on every socket call. Reads go through a per-thread scratch buffer, so an idle
 keep-alive connection holds no buffers, only its slot. Responses go out with one `writev` when the socket accepts it.
 JWTs (HS256, `alg`, signature, `exp`, `nbf`) are verified on every request on the IO thread. If `accept` fails for
 lack of descriptors or memory, the listener leaves the epoll set for 100 ms (open connections keep being served)
@@ -112,6 +118,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 | `BCRYPT_IDLE` | 1 | hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
+| `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
 | `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
 
 Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
@@ -131,7 +138,7 @@ depth-th newest id as a floor) from `rust-epoll-theCatWisel` (#105), which credi
 entries (#61, #100); feeds in batches of their own and long gathers from #117; one read of the tags table per batch
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
-merged favorite/follow statements also in #105. Idle-priority bcrypt, leaving quick-ack mode after each response and
+merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Idle-priority bcrypt, leaving quick-ack mode after each response and
 group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117).
 
 Built with Claude (Anthropic).

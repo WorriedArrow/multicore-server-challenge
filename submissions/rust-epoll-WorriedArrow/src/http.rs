@@ -120,7 +120,14 @@ impl Server {
         Ok(())
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, private_fds: bool, unshared: &std::sync::Barrier) {
+        // A descriptor table of this thread's own: client sockets are only ever touched by the thread that accepted
+        // them, and with an unshared table the kernel skips the shared table's locking and per-call reference counts
+        // on every accept, read, write and close.
+        if private_fds {
+            unsafe { libc::unshare(libc::CLONE_FILES) };
+        }
+        unshared.wait();
         let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
         loop {
             let timeout = match self.accept_paused {
@@ -227,6 +234,7 @@ impl Server {
         }
         c.fd = -1;
         c.generation = c.generation.wrapping_add(1);
+        reply::set_live(self.thread, slot, c.generation);
         c.inbuf = Vec::new();
         c.outbuf = Vec::new();
         c.out_pos = 0;
@@ -255,6 +263,8 @@ impl Server {
             if n == 0 {
                 let c = &mut self.conns[slot as usize];
                 c.peer_closed = true;
+                // queued work for this client can be skipped; its reply only closes the connection
+                reply::set_live(self.thread, slot, c.generation.wrapping_add(1));
                 if !c.busy {
                     self.close(slot);
                 } else {

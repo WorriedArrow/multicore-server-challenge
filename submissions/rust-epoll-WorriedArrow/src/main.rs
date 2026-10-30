@@ -96,10 +96,15 @@ fn main() {
         std::thread::Builder::new().name("bcrypt-rescue".into()).spawn(move || db::bcrypt_rescue(settings)).unwrap();
     }
     let mut handles = Vec::new();
+    // Every IO thread takes a private copy of the descriptor table before any of them serves a request (see
+    // Server::run); the barrier keeps the database lanes from opening sockets that a copy would then hold on to.
+    let unshared = std::sync::Arc::new(std::sync::Barrier::new(io_threads));
+    let private_fds = env_or("PRIVATE_FDS", 1) != 0;
     for t in 0..io_threads {
         let lfd = http::listener(&host, port).expect("listen");
         let server = http::Server::new(t as u16, lfd, keys).expect("epoll");
-        handles.push(std::thread::Builder::new().name("io".into()).spawn(move || server.run()).unwrap());
+        let unshared = unshared.clone();
+        handles.push(std::thread::Builder::new().name("io".into()).spawn(move || server.run(private_fds, &unshared)).unwrap());
     }
     eprintln!(
         "listening on {host}:{port}: {io_threads} io threads, {read_lanes} read lanes ({feed_lanes} for feeds), {write_lanes} write lanes, {bcrypt_threads} bcrypt threads x {bcrypt_lanes} lanes"
