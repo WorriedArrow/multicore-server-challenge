@@ -41,7 +41,7 @@ fn main() {
     }
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 
-    let io_threads: usize = env_or("IO_THREADS", (cpus / 4).max(1));
+    let io_threads: usize = env_or("IO_THREADS", (cpus / 2).max(1));
     let read_lanes: usize = env_or("READ_LANES", cpus.max(2));
     let write_lanes: usize = env_or("WRITE_LANES", 1);
     let bcrypt_threads: usize = env_or("BCRYPT_THREADS", 2);

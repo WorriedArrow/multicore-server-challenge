@@ -106,7 +106,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 
 | Variable | Default | |
 |---|---|---|
-| `IO_THREADS` | cores / 4 | epoll threads |
+| `IO_THREADS` | cores / 2 | epoll threads |
 | `READ_LANES` | cores | read connections |
 | `WRITE_LANES` | 1 | group-commit connections |
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
