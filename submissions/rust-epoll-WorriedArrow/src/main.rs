@@ -36,7 +36,7 @@ fn main() {
         cfg: pg::Config::parse(&url).expect("DATABASE_URL must be postgres://user:password@host:port/db"),
         keys,
         read_batch: env_or("READ_BATCH", 4096),
-        read_min: env_or("READ_MIN", 100_000),
+        read_min: env_or("READ_MIN", 32),
         read_window: Duration::from_micros(env_or("READ_WINDOW_US", 20_000)),
         write_batch: env_or("WRITE_BATCH", 256),
         bcrypt_lanes: env_or::<usize>("BCRYPT_LANES", 6).clamp(1, 6),

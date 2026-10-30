@@ -14,9 +14,9 @@ fn s(name: &'static str, sql: impl Into<String>, types: &'static [u32]) -> Stmt 
     Stmt { name, sql: sql.into(), types }
 }
 
-/// Proof that a count reaches the 1,000 cap without aggregating, else the exact count.
+/// A count capped at 1,000, in one pass over at most 1,000 index entries.
 fn capped(rows: &str) -> String {
-    format!("CASE WHEN EXISTS ({rows} OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM ({rows} LIMIT 1000) s) END")
+    format!("(SELECT count(*) FROM ({rows} LIMIT 1000) s)")
 }
 
 /// Article row columns, after `k`: [id, author_id, slug, title, description, created_at, updated_at].
@@ -26,7 +26,7 @@ const PAD: &str = "NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timesta
 
 pub fn read_statements() -> Vec<Stmt> {
     vec![
-        s("tags", "SELECT ARRAY(SELECT name FROM tags ORDER BY name)", &[]),
+        s("tags", "SELECT id, name FROM tags ORDER BY name", &[]),
         s(
             "uid",
             "SELECT r.k, u.id, u.username, u.email, u.bio, u.image FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) \
@@ -120,21 +120,38 @@ pub fn read_statements() -> Vec<Stmt> {
             &[TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // Personal feeds: capped counts per distinct viewer ($1, k <= 0), pages per (viewer, limit, offset) (k > 0).
-        // The page reads at most limit + offset of each followee's newest ids from articles_author_idx.
+        // Followees shared by several viewers of the batch ("hubs", popular authors) are looked at once for the
+        // whole batch: whether they have 1,000+ articles (then every viewer following one counts 1,000 without
+        // scanning), and the id of their depth-th newest article (a floor: a page of depth d is made of articles at
+        // least that new, so every other followee's scan stops there). Other followees are read per viewer, at most
+        // limit + offset newest ids each, from articles_author_idx.
         s(
             "feed",
             format!(
-                "SELECT -r.k, {}, {PAD} FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) \
+                "WITH u AS MATERIALIZED ( \
+                   SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, \
+                     COALESCE((SELECT max(p.lim + p.off) FROM unnest($2::int8[], $3::int8[], $4::int8[]) p(v, lim, off) \
+                       WHERE p.v = r.v), 1) AS depth \
+                   FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)), \
+                 hubs AS MATERIALIZED ( \
+                   SELECT h.fid, \
+                     (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
+                     EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
+                   FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) \
+                     GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), \
+                 big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids) \
+                 SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 \
+                   ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, {PAD} \
+                 FROM u \
                  UNION ALL \
-                 SELECT r.k, {COLS} FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) \
-                 CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL \
-                   (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.lim + r.off) y \
-                   WHERE fo.follower_id = r.v ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x \
-                 JOIN articles a ON a.id = x.id",
-                capped(
-                    "SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) \
-                     ORDER BY a.author_id, a.id DESC"
-                )
+                 SELECT p.k, {COLS} FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) \
+                 JOIN u ON u.v = p.v \
+                 CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl \
+                 CROSS JOIN LATERAL (SELECT y.id FROM unnest(u.fids) f(fid) CROSS JOIN LATERAL \
+                   (SELECT a2.id FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= fl.floor_id \
+                     ORDER BY a2.id DESC LIMIT p.lim + p.off) y \
+                   ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x \
+                 JOIN articles a ON a.id = x.id"
             ),
             &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
@@ -146,13 +163,6 @@ pub fn read_statements() -> Vec<Stmt> {
              (SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image \
              FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
             &[INT8_ARRAY, INT8_ARRAY],
-        ),
-        // The names of every tag those articles carry, in the database's name order (tagList is sorted by name).
-        s(
-            "tagnames",
-            "SELECT t.id, t.name FROM tags t WHERE t.id IN \
-             (SELECT at.tag_id FROM article_tags at WHERE at.article_id = ANY($1::int8[])) ORDER BY t.name",
-            &[INT8_ARRAY],
         ),
         // Viewer flags: (0, viewer, article) for each favorited pair asked about, (1, viewer, followee) for each
         // followed pair. Each viewer's candidates go in one primary-key range scan (= ANY) instead of a probe each.
