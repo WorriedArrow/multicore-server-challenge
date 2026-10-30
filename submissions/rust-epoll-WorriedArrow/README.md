@@ -45,13 +45,13 @@ followed by many) is looked at once: whether it has 1,000 or more articles (then
 pages, which can only hold articles at least that new, so every other followee's index scan stops there.
 
 **Forming batches.** Lanes take turns forming batches: one lane collects while the others execute theirs. It takes
-what is waiting as soon as a typical batch's worth is queued (a moving average of recent batch sizes), or once the
-oldest waiting request has waited 20 ms. At low load batches still fill for the window instead of being whatever
-trickled in since the last lane freed up; under a backlog nothing waits on a timer, and batches don't shrink.
-Postgres pays a fixed cost per statement execution, and a batch of a few hundred requests splits it a few hundred
-ways; everything requests have in common (the newest page, the tag list, a viral article's favorite count and comment
-thread) is read once per batch instead of once per request. Pushing a request only wakes the collecting lane when its
-batch is ready, not on every request.
+what is waiting once the oldest waiting request has waited 40 ms (or 4,096 are queued). Under a backlog the oldest
+has already waited that long, so nothing waits on a timer; at lower load batches fill for the window instead of
+being whatever trickled in since the last lane freed up. Postgres pays a fixed cost per statement execution, and a
+batch of a few hundred requests splits it a few hundred ways; everything requests have in common (the newest page,
+the tag list, a viral article's favorite count and comment thread) is read once per batch instead of once per
+request. Feeds, the slowest read, have a quarter of the lanes to themselves, so other reads never wait for a feed in
+their batch. Pushing a request only wakes the collecting lane when its batch is ready, not on every request.
 
 Nothing outlives its batch: every value in a response was read from Postgres while that request was waiting, and
 only requests already queued when the batch started share it.
@@ -106,8 +106,9 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
 | `BCRYPT_WINDOW_MS` | 400 | how long the first bcrypt thread waits to fill its lanes |
-| `READ_WINDOW_US` | 20000 | the longest the oldest request waits for its batch to fill |
-| `READ_MIN` | 32 | a batch is taken once this many (or the recent average, if larger) are waiting |
+| `READ_WINDOW_US` | 40000 | the longest the oldest request waits for its batch to fill |
+| `FEED_LANES` | read lanes / 4 | read lanes that serve only feeds (0: all lanes serve every read) |
+| `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 | `BCRYPT_IDLE` | 1 | hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
@@ -127,7 +128,7 @@ Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
 
 Ideas from other entries: the shared feed hubs (followees checked once per batch for 1,000+ articles, and their
 depth-th newest id as a floor) from `rust-epoll-theCatWisel` (#105), which credits the heavy-author count to earlier
-entries (#61, #100); following the load when forming batches, also from #105; one read of the tags table per batch
+entries (#61, #100); feeds in batches of their own and long gathers from #117; one read of the tags table per batch
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
 merged favorite/follow statements also in #105. Idle-priority bcrypt, leaving quick-ack mode after each response and

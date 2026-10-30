@@ -56,8 +56,8 @@ fn main() {
         cfg: pg::Config::parse(&url).expect("DATABASE_URL must be postgres://user:password@host:port/db"),
         keys,
         read_batch: env_or("READ_BATCH", 4096),
-        read_min: env_or("READ_MIN", 32),
-        read_window: Duration::from_micros(env_or("READ_WINDOW_US", 20_000)),
+        read_min: env_or("READ_MIN", 4096),
+        read_window: Duration::from_micros(env_or("READ_WINDOW_US", 40_000)),
         write_batch: env_or("WRITE_BATCH", 256),
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
@@ -76,8 +76,9 @@ fn main() {
 
     http::ACK_DELAY.store(env_or("ACK_DELAY", 1) != 0, std::sync::atomic::Ordering::Relaxed);
     reply::init(io_threads);
-    // FEED_LANES of the read lanes (and connections) serve only feeds; 0: every lane serves every read.
-    let feed_lanes: usize = env_or::<usize>("FEED_LANES", 0).min(read_lanes.saturating_sub(1));
+    // FEED_LANES of the read lanes (and connections) serve only feeds (a quarter by default); 0: every lane serves
+    // every read.
+    let feed_lanes: usize = env_or::<usize>("FEED_LANES", read_lanes / 4).min(read_lanes.saturating_sub(1));
     db::FEED_SPLIT.store(feed_lanes > 0, std::sync::atomic::Ordering::Relaxed);
     for i in 0..read_lanes {
         let pool = if i < feed_lanes { &db::FEEDS } else { &db::READS };
@@ -101,7 +102,7 @@ fn main() {
         handles.push(std::thread::Builder::new().name("io".into()).spawn(move || server.run()).unwrap());
     }
     eprintln!(
-        "listening on {host}:{port}: {io_threads} io threads, {read_lanes} read lanes, {write_lanes} write lanes, {bcrypt_threads} bcrypt threads x {bcrypt_lanes} lanes"
+        "listening on {host}:{port}: {io_threads} io threads, {read_lanes} read lanes ({feed_lanes} for feeds), {write_lanes} write lanes, {bcrypt_threads} bcrypt threads x {bcrypt_lanes} lanes"
     );
     for h in handles {
         let _ = h.join();

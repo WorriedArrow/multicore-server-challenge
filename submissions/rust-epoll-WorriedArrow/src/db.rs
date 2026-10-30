@@ -94,8 +94,8 @@ impl Pool {
     }
 }
 
-/// Every read, except feeds when they have lanes of their own (FEED_LANES > 0): a feed is the slowest read, and in
-/// its own batches the others don't wait for it.
+/// Every read, except feeds when they have lanes of their own (FEED_LANES, a quarter of the lanes by default): a feed
+/// is the slowest read, and in its own batches the others don't wait for it.
 pub static READS: Pool = Pool::new();
 pub static FEEDS: Pool = Pool::new();
 pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
