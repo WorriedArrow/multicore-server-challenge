@@ -79,11 +79,34 @@ pub struct UserOut {
     pub image: Option<Vec<u8>>,
 }
 
-pub static READS: Queue<ReadJob> = Queue::new();
-/// Held by the read lane that is currently forming a batch.
-static GATHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Moving average of read batch sizes.
-static BATCH_LEN: AtomicU64 = AtomicU64::new(0);
+/// A read queue and the lanes that serve it.
+pub struct Pool {
+    pub q: Queue<ReadJob>,
+    /// Held by the lane of this pool that is currently forming a batch.
+    gather: std::sync::Mutex<()>,
+    /// Moving average of this pool's batch sizes.
+    batch_len: AtomicU64,
+}
+
+impl Pool {
+    const fn new() -> Pool {
+        Pool { q: Queue::new(), gather: std::sync::Mutex::new(()), batch_len: AtomicU64::new(0) }
+    }
+}
+
+/// Every read, except feeds when they have lanes of their own (FEED_LANES > 0): a feed is the slowest read, and in
+/// its own batches the others don't wait for it.
+pub static READS: Pool = Pool::new();
+pub static FEEDS: Pool = Pool::new();
+pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn push_read(job: ReadJob) {
+    if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
+        FEEDS.q.push(job);
+    } else {
+        READS.q.push(job);
+    }
+}
 pub static WRITES: Queue<WriteJob> = Queue::new();
 pub static BCRYPT: Queue<BcryptJob> = Queue::new();
 
@@ -96,6 +119,7 @@ pub struct Settings {
     pub write_batch: usize,
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
+    pub bcrypt_idle: bool,
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -248,13 +272,14 @@ type PageRows<'p> = Vec<ArtRef<'p>>;
 pub struct ReadLane {
     conn: Option<Conn>,
     s: &'static Settings,
+    pool: &'static Pool,
 }
 
 const LIST_STMTS: [&str; 3] = ["tag", "author", "favlist"];
 
 impl ReadLane {
-    pub fn new(s: &'static Settings) -> ReadLane {
-        ReadLane { conn: None, s }
+    pub fn new(s: &'static Settings, pool: &'static Pool) -> ReadLane {
+        ReadLane { conn: None, s, pool }
     }
 
     fn conn(&mut self) -> pg::Result<&mut Conn> {
@@ -277,13 +302,14 @@ impl ReadLane {
                 // what is waiting as soon as there is a typical batch's worth (a moving average of recent batch
                 // sizes, so batches never shrink under load), or once the oldest waiting request has waited the
                 // window. Under a backlog nothing waits for a timer; at low load batches still fill for the window.
-                let _turn = GATHER.lock().unwrap();
-                let want = (BATCH_LEN.load(Relaxed) as usize).max(self.s.read_min);
-                READS.take_aged(want, self.s.read_window, self.s.read_batch, &mut jobs);
+                let p = self.pool;
+                let _turn = p.gather.lock().unwrap();
+                let want = (p.batch_len.load(Relaxed) as usize).max(self.s.read_min);
+                p.q.take_aged(want, self.s.read_window, self.s.read_batch, &mut jobs);
             }
             let n = jobs.len() as u64;
-            let prev = BATCH_LEN.load(Relaxed);
-            BATCH_LEN.store(if prev == 0 { n } else { (prev * 7 + n) / 8 }, Relaxed);
+            let prev = self.pool.batch_len.load(Relaxed);
+            self.pool.batch_len.store(if prev == 0 { n } else { (prev * 7 + n) / 8 }, Relaxed);
             let batch = std::mem::take(&mut jobs);
             let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
             let res = self.batch(batch);
@@ -999,12 +1025,10 @@ impl WriteLane {
             Ok(c) => c,
             Err(e) => return Err((e, tos)),
         };
+        // Everything up to the Sync is one implicit transaction: it commits at the Sync (one WAL flush for the
+        // group) or, if any statement fails, rolls back whole. Responses are released after ReadyForQuery.
         let single = jobs.len() == 1 && write_plan(&jobs[0]).len() == 1;
         let mut n = 0;
-        if !single {
-            conn.out.bind_exec("begin", &[]);
-            n += 1;
-        }
         let mut spans = Vec::with_capacity(jobs.len());
         let mut i = 0;
         while i < jobs.len() {
@@ -1026,10 +1050,6 @@ impl WriteLane {
                 n += k;
             }
             i = e;
-        }
-        if !single {
-            conn.out.bind_exec("commit", &[]);
-            n += 1;
         }
         conn.out.sync();
         let p = match conn.flush().and_then(|_| conn.read_pipeline(n)) {
@@ -1064,18 +1084,9 @@ impl WriteLane {
     fn one(&mut self, j: WriteJob) -> pg::Result<()> {
         let conn = self.conn()?;
         let k = write_plan(&j).len();
-        let mut n = 0;
-        if k > 1 {
-            conn.out.bind_exec("begin", &[]);
-            n += 1;
-        }
-        let start = n;
+        let start = 0;
         bind_write(&mut conn.out, &j);
-        n += k;
-        if k > 1 {
-            conn.out.bind_exec("commit", &[]);
-            n += 1;
-        }
+        let n = k;
         conn.out.sync();
         conn.flush()?;
         let p = conn.read_pipeline(n)?;
@@ -1134,16 +1145,16 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
             None => out.push(reply::error(to, 404, "profile not found")),
         },
         Write::Favorite { .. } => match first {
-            Some(r) => READS.push(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::CreateArticle { .. } => match first {
-            Some(r) => READS.push(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 201 }, viewer: v, to }),
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 201 }, viewer: v, to }),
             None => out.push(reply::error(to, 500, "internal error")),
         },
         Write::UpdateArticle { .. } => match first {
             Some(r) if p.i64(r[1]) != v => out.push(reply::error(to, 403, "not the author")),
-            Some(r) => READS.push(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::DeleteArticle { .. } => match first {
@@ -1183,6 +1194,11 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
 /// Worker 0 waits up to the window to fill its lanes, then runs what it has. Other workers only take full sets of
 /// lanes, so they add capacity under a backlog without splitting the trickle of logins into half-empty runs.
 pub fn bcrypt_worker(s: &'static Settings, index: usize) {
+    if s.bcrypt_idle {
+        // Hashing only takes CPU nothing else wants: SCHED_IDLE for this thread (no privileges needed).
+        let p = libc::sched_param { sched_priority: 0 };
+        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) };
+    }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
         jobs.clear();
@@ -1218,6 +1234,37 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
                     if let BcryptJob::Verify { to, .. } = j {
                         reply::send(to, 401, reply::error_body("invalid email or password"));
                     }
+                }
+            }
+        }
+    }
+}
+
+/// With idle-priority hashers: a normal-priority thread that hashes only what has waited a second already, so logins
+/// still finish when the box has no idle time at all.
+pub fn bcrypt_rescue(s: &'static Settings) {
+    let mut jobs: Vec<BcryptJob> = Vec::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        jobs.clear();
+        while BCRYPT.take_if_older(Duration::from_secs(1), s.bcrypt_lanes, &mut jobs) {
+            let batch = std::mem::take(&mut jobs);
+            let (ten, odd): (Vec<BcryptJob>, Vec<BcryptJob>) = batch.into_iter().partition(|j| match j {
+                BcryptJob::Verify { hash, .. } => crate::bcrypt::parse(hash).map(|p| p.cost) == Some(10),
+                BcryptJob::Hash { .. } => true,
+            });
+            run_bcrypt(ten, s, 10);
+            for j in odd {
+                match &j {
+                    BcryptJob::Verify { hash, .. } => match crate::bcrypt::parse(hash).map(|p| p.cost) {
+                        Some(c) => run_bcrypt(vec![j], s, c),
+                        None => {
+                            if let BcryptJob::Verify { to, .. } = j {
+                                reply::send(to, 401, reply::error_body("invalid email or password"));
+                            }
+                        }
+                    },
+                    _ => run_bcrypt(vec![j], s, 10),
                 }
             }
         }

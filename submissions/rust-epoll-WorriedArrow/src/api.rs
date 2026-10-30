@@ -199,7 +199,7 @@ fn auth(keys: &crate::jwt::Keys, h: Option<&[u8]>) -> Auth {
 }
 
 fn read(kind: Read, viewer: i64, to: ReplyTo) -> Outcome {
-    db::READS.push(ReadJob { kind, viewer, to });
+    db::push_read(ReadJob { kind, viewer, to });
     Outcome::Queued
 }
 

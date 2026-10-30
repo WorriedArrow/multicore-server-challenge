@@ -56,10 +56,11 @@ batch is ready, not on every request.
 Nothing outlives its batch: every value in a response was read from Postgres while that request was waiting, and
 only requests already queued when the batch started share it.
 
-**Writes** go through one write lane with group commit: every waiting write runs in one transaction
-(`BEGIN`, the writes, `COMMIT`, one `Sync`), and responses are released only after `COMMIT` returns. If any statement
-in a group fails, the group rolls back and each write is retried in its own transaction, so one bad write can't fail
-the others. A write whose commit outcome is unknown (connection lost) is never retried. Consecutive favorites,
+**Writes** go through one write lane with group commit: every waiting write is pipelined before one `Sync`, which
+makes them one implicit transaction (no `BEGIN`/`COMMIT` statements), committed at the `Sync` with one WAL flush;
+responses are released only after Postgres reports it done. If any statement in a group fails, the group rolls back
+and each write is retried on its own, so one bad write can't fail the others. A write whose commit outcome is unknown
+(connection lost) is never retried. Consecutive favorites,
 unfavorites, follows, unfollows or new comments in a group run as one statement over arrays of their parameters
 (new comment ids drawn in request order), and its rows are split back per request. Writes that return an article
 (favorite, create, update) read it through the read lanes after the commit, in a new snapshot.
@@ -68,7 +69,9 @@ unfavorites, follows, unfollows or new comments in a group run as one statement 
 loads, and interleaving independent hashes lets the core overlap them. How many lanes pay off depends on the CPU
 (its L1 and registers hold a few 4 KB S-box sets, not many), so at startup the server times widths 1 to 6 on throwaway
 keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
-worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
+worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. The hashing threads run
+under `SCHED_IDLE`: they only use CPU nothing else wants. A normal-priority thread hashes whatever has waited a
+second, so logins still finish on a box with no idle time. Every hash still does all
 2^10 rounds; logins always verify against the stored hash.
 
 **Postgres session settings** (startup parameters on its own connections, nothing server-wide):
@@ -81,6 +84,9 @@ array sizes, its cost estimate crosses `jit_above_cost`, and compiling took mill
 thread inherits it). Our threads wake constantly (a request, a reply, a ready batch), and under the default policy
 each wakeup can preempt a busy Postgres backend; batch threads get the same CPU share without cutting in line.
 `SCHED_BATCH=0` turns it off.
+
+**Fewer packets**: after each response the server leaves TCP quick-ack mode on that socket, so the ACK for the
+client's next request rides on the response to it instead of going out as a packet of its own.
 
 **HTTP**: one epoll thread per `SO_REUSEPORT` listener. Reads go through a per-thread scratch buffer, so an idle
 keep-alive connection holds no buffers, only its slot. Responses go out with one `writev` when the socket accepts it.
@@ -103,6 +109,8 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_WINDOW_US` | 20000 | the longest the oldest request waits for its batch to fill |
 | `READ_MIN` | 32 | a batch is taken once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
+| `BCRYPT_IDLE` | 1 | hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
+| `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
 | `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
 
 Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
@@ -122,6 +130,7 @@ depth-th newest id as a floor) from `rust-epoll-theCatWisel` (#105), which credi
 entries (#61, #100); following the load when forming batches, also from #105; one read of the tags table per batch
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
-merged favorite/follow statements also in #105.
+merged favorite/follow statements also in #105. Idle-priority bcrypt, leaving quick-ack mode after each response and
+group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117).
 
 Built with Claude (Anthropic).

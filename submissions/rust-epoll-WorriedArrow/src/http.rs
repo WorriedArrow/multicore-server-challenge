@@ -10,6 +10,9 @@ use crate::reply::{self, ReplyTo};
 
 const LISTENER: u64 = u64::MAX;
 const OUTBOX: u64 = u64::MAX - 1;
+/// Delay ACKs on client sockets (see `respond`).
+pub static ACK_DELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -469,6 +472,12 @@ impl Server {
         }
         let hl = 160 - w.len();
         let fd = c.fd;
+        if ACK_DELAY.load(std::sync::atomic::Ordering::Relaxed) {
+            // Leave quick-ack mode, so the ACK for the client's next request rides on our response to it instead of
+            // going out as a packet of its own (the kernel re-enters quick-ack mode by itself, hence every time).
+            let zero: libc::c_int = 0;
+            unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &zero as *const _ as *const libc::c_void, 4) };
+        }
         if c.outbuf.len() > c.out_pos {
             c.outbuf.extend_from_slice(&head[..hl]);
             c.outbuf.extend_from_slice(body);

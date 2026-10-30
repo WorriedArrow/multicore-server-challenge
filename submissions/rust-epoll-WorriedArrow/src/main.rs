@@ -61,6 +61,7 @@ fn main() {
         write_batch: env_or("WRITE_BATCH", 256),
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
+        bcrypt_idle: env_or("BCRYPT_IDLE", 1) != 0,
     }));
 
     // Fail fast if Postgres is unreachable or a statement doesn't prepare.
@@ -73,9 +74,14 @@ fn main() {
         }
     }
 
+    http::ACK_DELAY.store(env_or("ACK_DELAY", 1) != 0, std::sync::atomic::Ordering::Relaxed);
     reply::init(io_threads);
-    for _ in 0..read_lanes {
-        let lane = db::ReadLane::new(settings);
+    // FEED_LANES of the read lanes (and connections) serve only feeds; 0: every lane serves every read.
+    let feed_lanes: usize = env_or::<usize>("FEED_LANES", 0).min(read_lanes.saturating_sub(1));
+    db::FEED_SPLIT.store(feed_lanes > 0, std::sync::atomic::Ordering::Relaxed);
+    for i in 0..read_lanes {
+        let pool = if i < feed_lanes { &db::FEEDS } else { &db::READS };
+        let lane = db::ReadLane::new(settings, pool);
         std::thread::Builder::new().name("read".into()).spawn(move || lane.run()).unwrap();
     }
     for _ in 0..write_lanes {
@@ -84,6 +90,9 @@ fn main() {
     }
     for i in 0..bcrypt_threads {
         std::thread::Builder::new().name("bcrypt".into()).spawn(move || db::bcrypt_worker(settings, i)).unwrap();
+    }
+    if settings.bcrypt_idle {
+        std::thread::Builder::new().name("bcrypt-rescue".into()).spawn(move || db::bcrypt_rescue(settings)).unwrap();
     }
     let mut handles = Vec::new();
     for t in 0..io_threads {

@@ -142,4 +142,17 @@ impl<T> Queue<T> {
             self.cv.notify_one();
         }
     }
+
+    /// Takes up to `max` without blocking if the oldest item has waited at least `age`; returns whether it did.
+    pub fn take_if_older(&self, age: Duration, max: usize, out: &mut Vec<T>) -> bool {
+        let mut g = self.m.lock().unwrap();
+        match g.since {
+            Some(t) if t.elapsed() >= age => {
+                let n = g.q.len().min(max);
+                Self::drain(&mut g, n, out);
+                true
+            }
+            _ => false,
+        }
+    }
 }
