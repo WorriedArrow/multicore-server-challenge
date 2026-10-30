@@ -876,6 +876,44 @@ fn write_plan(w: &WriteJob) -> Vec<&'static str> {
     }
 }
 
+/// The statement that runs a run of consecutive writes of this kind as one, if there is one.
+fn merged_stmt(w: &WriteJob) -> Option<&'static str> {
+    match &w.kind {
+        Write::Favorite { on: true, .. } => Some("fav_n"),
+        Write::Favorite { on: false, .. } => Some("unfav_n"),
+        Write::Follow { on: true, .. } => Some("follow_n"),
+        Write::Follow { on: false, .. } => Some("unfollow_n"),
+        Write::CreateComment { .. } => Some("newcmt_n"),
+        _ => None,
+    }
+}
+
+/// Binds a run of writes that share `merged_stmt` as one statement over arrays.
+fn bind_run(o: &mut pg::Out, name: &str, run: &[WriteJob]) {
+    let viewers = int_array(run.iter().map(|w| w.viewer));
+    let keys = text_array(run.iter().map(|w| match &w.kind {
+        Write::Favorite { slug, .. } | Write::CreateComment { slug, .. } => slug.as_bytes(),
+        Write::Follow { username, .. } => username.as_bytes(),
+        _ => unreachable!(),
+    }));
+    if name == "newcmt_n" {
+        let bodies = text_array(run.iter().map(|w| match &w.kind {
+            Write::CreateComment { body, .. } => body.as_bytes(),
+            _ => unreachable!(),
+        }));
+        o.bind_exec(name, &[Param::Raw(&viewers), Param::Raw(&keys), Param::Raw(&bodies)]);
+    } else {
+        o.bind_exec(name, &[Param::Raw(&viewers), Param::Raw(&keys)]);
+    }
+}
+
+/// Where a write's result is: its own statements (first result, count), or row k of a merged run's result.
+#[derive(Clone, Copy)]
+enum Span {
+    Own(usize, usize),
+    Run(usize, i64),
+}
+
 fn opt_text(s: &Option<String>) -> Param<'_> {
     match s {
         Some(s) => Param::Text(s.as_bytes()),
@@ -968,11 +1006,26 @@ impl WriteLane {
             n += 1;
         }
         let mut spans = Vec::with_capacity(jobs.len());
-        for j in &jobs {
-            let k = write_plan(j).len();
-            spans.push((n, k));
-            bind_write(&mut conn.out, j);
-            n += k;
+        let mut i = 0;
+        while i < jobs.len() {
+            let name = merged_stmt(&jobs[i]);
+            let mut e = i + 1;
+            if name.is_some() {
+                while e < jobs.len() && merged_stmt(&jobs[e]) == name {
+                    e += 1;
+                }
+            }
+            if e - i >= 2 {
+                bind_run(&mut conn.out, name.unwrap(), &jobs[i..e]);
+                spans.extend((1..=(e - i) as i64).map(|k| Span::Run(n, k)));
+                n += 1;
+            } else {
+                let k = write_plan(&jobs[i]).len();
+                spans.push(Span::Own(n, k));
+                bind_write(&mut conn.out, &jobs[i]);
+                n += k;
+            }
+            i = e;
         }
         if !single {
             conn.out.bind_exec("commit", &[]);
@@ -995,8 +1048,14 @@ impl WriteLane {
             return Ok(());
         }
         let mut out = Vec::new();
-        for (j, (start, k)) in jobs.into_iter().zip(spans) {
-            finish_write(j, &p, start, k, self.s, &mut out);
+        for (j, span) in jobs.into_iter().zip(spans) {
+            match span {
+                Span::Own(start, k) => finish_write(j, &p, start, k, self.s, &mut out),
+                Span::Run(res, k) => {
+                    let row = p.results[res].rows.iter().find(|r| p.i64(r[0]) == k).map(|r| &r[1..]);
+                    finish_row(j, &p, row, self.s, &mut out);
+                }
+            }
         }
         reply::send_all(out);
         Ok(())
@@ -1029,7 +1088,6 @@ impl WriteLane {
 
 fn finish_write(j: WriteJob, p: &Pipeline, start: usize, k: usize, s: &Settings, out: &mut Vec<Response>) {
     let to = j.to;
-    let v = j.viewer;
     let results = &p.results[start..start + k];
     if let Some(e) = results.iter().find_map(|r| r.error.as_ref()) {
         if e.code == "23505" {
@@ -1040,7 +1098,13 @@ fn finish_write(j: WriteJob, p: &Pipeline, start: usize, k: usize, s: &Settings,
         }
         return;
     }
-    let first = results[0].rows.first();
+    finish_row(j, p, results[0].rows.first().map(|r| &r[..]), s, out);
+}
+
+/// Answers a committed write from its first result row (None: no row).
+fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, out: &mut Vec<Response>) {
+    let to = j.to;
+    let v = j.viewer;
     match j.kind {
         Write::Register { .. } => match first {
             Some(r) => {

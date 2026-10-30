@@ -24,6 +24,13 @@ fn main() {
     let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET");
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env_or("PORT", 80);
+    // SCHED_BATCH for this process (inherited by every thread it starts; no privileges needed): our threads wake up
+    // constantly (a request, a reply, a batch ready) and under the default policy each wakeup may preempt a busy
+    // Postgres backend. Batch threads still get their full CPU share, they just don't cut in line on wakeup.
+    if env_or("SCHED_BATCH", 1) != 0 {
+        let p = libc::sched_param { sched_priority: 0 };
+        unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &p) };
+    }
     // Raise the descriptor soft limit to the hard one (a setting of this process): every client holds a socket.
     unsafe {
         let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

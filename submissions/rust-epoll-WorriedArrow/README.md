@@ -59,7 +59,9 @@ only requests already queued when the batch started share it.
 **Writes** go through one write lane with group commit: every waiting write runs in one transaction
 (`BEGIN`, the writes, `COMMIT`, one `Sync`), and responses are released only after `COMMIT` returns. If any statement
 in a group fails, the group rolls back and each write is retried in its own transaction, so one bad write can't fail
-the others. A write whose commit outcome is unknown (connection lost) is never retried. Writes that return an article
+the others. A write whose commit outcome is unknown (connection lost) is never retried. Consecutive favorites,
+unfavorites, follows, unfollows or new comments in a group run as one statement over arrays of their parameters
+(new comment ids drawn in request order), and its rows are split back per request. Writes that return an article
 (favorite, create, update) read it through the read lanes after the commit, in a new snapshot.
 
 **bcrypt** runs on its own threads, several hashes in lockstep: a single bcrypt is one long chain of dependent S-box
@@ -74,6 +76,11 @@ worker only takes full sets, so a steady trickle of logins isn't split into half
 every execution (16% of Postgres CPU in a profile), and `jit = off`, because a generic plan can't see LIMIT values or
 array sizes, its cost estimate crosses `jit_above_cost`, and compiling took milliseconds per sub-millisecond statement.
 `max_parallel_workers_per_gather = 0`, for the same reason: a generic plan can't see how small a batch's arrays are.
+
+**Scheduling**: at startup the process puts itself under the `SCHED_BATCH` policy (no privileges needed; every
+thread inherits it). Our threads wake constantly (a request, a reply, a ready batch), and under the default policy
+each wakeup can preempt a busy Postgres backend; batch threads get the same CPU share without cutting in line.
+`SCHED_BATCH=0` turns it off.
 
 **HTTP**: one epoll thread per `SO_REUSEPORT` listener. Reads go through a per-thread scratch buffer, so an idle
 keep-alive connection holds no buffers, only its slot. Responses go out with one `writev` when the socket accepts it.
@@ -96,6 +103,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_WINDOW_US` | 20000 | the longest the oldest request waits for its batch to fill |
 | `READ_MIN` | 32 | a batch is taken once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
+| `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
 
 Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
 
@@ -113,6 +121,7 @@ Ideas from other entries: the shared feed hubs (followees checked once per batch
 depth-th newest id as a floor) from `rust-epoll-theCatWisel` (#105), which credits the heavy-author count to earlier
 entries (#61, #100); following the load when forming batches, also from #105; one read of the tags table per batch
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
-`accept` on `EMFILE` from `asm-epoll-nickita-khylkouski` (#82).
+`accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
+merged favorite/follow statements also in #105.
 
 Built with Claude (Anthropic).

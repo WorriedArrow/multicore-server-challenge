@@ -227,6 +227,56 @@ pub fn write_statements() -> Vec<Stmt> {
              SELECT id FROM t",
             &[crate::pg::INT8, crate::pg::TEXT],
         ),
+        // Runs of the same kind of write in a group, as one statement over arrays (row k = the run's k-th write; the
+        // columns after k are the single statement's). Inserts take their rows in key order, so concurrent groups lock
+        // in the same order.
+        s(
+            "fav_n",
+            "WITH r AS (SELECT x.k, x.uid, a.id AS aid FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(uid, slug, k) \
+               JOIN articles a ON a.slug = x.slug), \
+             w AS (INSERT INTO favorites (user_id, article_id) SELECT DISTINCT uid, aid FROM r ORDER BY 1, 2 ON CONFLICT DO NOTHING) \
+             SELECT k, aid FROM r",
+            &[INT8_ARRAY, TEXT_ARRAY],
+        ),
+        s(
+            "unfav_n",
+            "WITH r AS (SELECT x.k, x.uid, a.id AS aid FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(uid, slug, k) \
+               JOIN articles a ON a.slug = x.slug), \
+             w AS (DELETE FROM favorites f USING r WHERE f.user_id = r.uid AND f.article_id = r.aid) \
+             SELECT k, aid FROM r",
+            &[INT8_ARRAY, TEXT_ARRAY],
+        ),
+        s(
+            "follow_n",
+            "WITH r AS (SELECT x.k, x.fid, u.id AS tid, u.username, u.bio, u.image \
+               FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(fid, uname, k) JOIN users u ON u.username = x.uname), \
+             w AS (INSERT INTO follows (follower_id, followee_id) SELECT DISTINCT fid, tid FROM r ORDER BY 1, 2 ON CONFLICT DO NOTHING) \
+             SELECT k, username, bio, image FROM r",
+            &[INT8_ARRAY, TEXT_ARRAY],
+        ),
+        s(
+            "unfollow_n",
+            "WITH r AS (SELECT x.k, x.fid, u.id AS tid, u.username, u.bio, u.image \
+               FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(fid, uname, k) JOIN users u ON u.username = x.uname), \
+             w AS (DELETE FROM follows fo USING r WHERE fo.follower_id = r.fid AND fo.followee_id = r.tid) \
+             SELECT k, username, bio, image FROM r",
+            &[INT8_ARRAY, TEXT_ARRAY],
+        ),
+        // New comments: ids drawn in request order, so comments made in one transaction (same created_at) still list
+        // newest first.
+        s(
+            "newcmt_n",
+            "WITH r AS MATERIALIZED (SELECT x.k, x.uid, x.body, a.id AS aid \
+               FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
+               JOIN articles a ON a.slug = x.slug ORDER BY x.k), \
+             ids AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval(pg_get_serial_sequence('comments', 'id')) AS id \
+               FROM (SELECT * FROM r ORDER BY k OFFSET 0) s), \
+             c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT id, aid, uid, body FROM ids \
+               RETURNING id, body, created_at, updated_at, author_id) \
+             SELECT ids.k, c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image \
+             FROM c JOIN ids ON ids.id = c.id JOIN users u ON u.id = c.author_id",
+            &[INT8_ARRAY, TEXT_ARRAY, TEXT_ARRAY],
+        ),
         s(
             "newart",
             format!(
