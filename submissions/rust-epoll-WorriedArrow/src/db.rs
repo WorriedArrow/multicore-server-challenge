@@ -1347,11 +1347,12 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
 /// Worker 0 waits up to the window to fill its lanes, then runs what it has. Other workers only take full sets of
 /// lanes, so they add capacity under a backlog without splitting the trickle of logins into half-empty runs.
 pub fn bcrypt_worker(s: &'static Settings, index: usize) {
-    // Hashing only takes CPU nothing else wants: the hash loop itself runs under SCHED_IDLE (no privileges needed).
-    // Only the loop: an idle thread can sit preempted for seconds on a busy box, and anything it holds then (a
-    // reply outbox mutex, the queue lock, the allocator's mmap lock) stalls normal threads behind it.
+    // Hashing yields to everything else: the thread runs at nice 19 (raising one's own nice needs no privileges).
+    // A nice thread still gets a small share, so a lock it holds when preempted (a reply outbox, a queue) is freed
+    // within milliseconds; SCHED_IDLE could hold one for seconds on a busy box, and an unprivileged thread can't
+    // leave SCHED_IDLE again to take its locks at normal priority.
     if s.bcrypt_idle {
-        IDLE_HASH.with(|c| c.set(Some(unsafe { libc::sched_getscheduler(0) })));
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19) };
     }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
@@ -1394,7 +1395,7 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     }
 }
 
-/// With idle-priority hashers: a normal-priority thread that hashes only what has waited BCRYPT_RESCUE_MS (a second) already, so logins
+/// With low-priority hashers: a normal-priority thread that hashes only what has waited BCRYPT_RESCUE_MS (a second) already, so logins
 /// still finish when the box has no idle time at all.
 pub fn bcrypt_rescue(s: &'static Settings) {
     let mut jobs: Vec<BcryptJob> = Vec::new();
@@ -1489,11 +1490,6 @@ fn run_bcrypt(jobs: Vec<BcryptJob>, s: &Settings, cost: u32) {
 fn run_lanes(pw: &[&[u8]], salts: &[[u8; 16]], cost: u32) -> Vec<[u8; 23]> {
     use crate::bcrypt::{raw_n, Job};
     let mut out = Vec::with_capacity(pw.len());
-    let normal = IDLE_HASH.with(|c| c.get());
-    let p = libc::sched_param { sched_priority: 0 };
-    if normal.is_some() {
-        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) };
-    }
     let mut i = 0;
     while i < pw.len() {
         let left = pw.len() - i;
@@ -1513,13 +1509,5 @@ fn run_lanes(pw: &[&[u8]], salts: &[[u8; 16]], cost: u32) -> Vec<[u8; 23]> {
             _ => go!(6),
         }
     }
-    if let Some(policy) = normal {
-        unsafe { libc::sched_setscheduler(0, policy, &p) };
-    }
     out
-}
-
-thread_local! {
-    /// Set on idle-priority hashers: the policy to return to after each hash loop.
-    static IDLE_HASH: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }

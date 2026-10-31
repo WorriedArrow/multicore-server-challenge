@@ -123,7 +123,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
-| `BCRYPT_IDLE` | 0 | 1: the hash loops run under `SCHED_IDLE`, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
+| `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
 | `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
