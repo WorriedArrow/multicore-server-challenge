@@ -35,6 +35,10 @@ shared queue, of every endpoint, and answers the whole batch in two pipelined ro
    The per-viewer `favorited` / `following` flags are one primary-key range scan per viewer (`= ANY(...)`) instead
    of a probe per article.
 
+Phase A sends a first `Sync` after the tag list, current-user and login lookups, so those requests (about a quarter
+of all traffic) are answered, or handed to bcrypt, before the rest of the batch and its phase B; every tag-list
+request of a batch gets the same body, built once.
+
 Tag names come from one read of the 200-row tags table per batch, in the database's own name order; the same rows
 answer `GET /api/tags` and order every article's `tagList`. Each article's JSON is written once per batch with the
 two viewer-dependent booleans left open, and spliced per response.
@@ -42,7 +46,10 @@ two viewer-dependent booleans left open, and spliced per response.
 **Feeds** share work between the viewers of a batch. A followee followed by several of them (popular authors are
 followed by many) is looked at once: whether it has 1,000 or more articles (then every viewer following it counts
 1,000 without a scan), and the id of its `limit + offset`-th newest article. That id is a floor for those viewers'
-pages, which can only hold articles at least that new, so every other followee's index scan stops there.
+pages, which can only hold articles at least that new, so every other followee's index scan stops there. Feed pages
+come back as article ids and authors only, straight from `articles_author_idx`; the columns of articles no other
+statement in the batch returned are read once per distinct article in phase B, since popular followees' newest
+articles are on many viewers' pages at once. A feed's articles are by followed authors, so they need no follow probe.
 
 **Forming batches.** Lanes take turns forming batches: one lane collects while the others execute theirs. It takes
 what is waiting once the oldest waiting request has waited 40 ms (or 4,096 are queued). Under a backlog the oldest
