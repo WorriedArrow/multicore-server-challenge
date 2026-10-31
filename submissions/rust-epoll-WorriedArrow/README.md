@@ -57,8 +57,7 @@ has already waited that long, so nothing waits on a timer; at lower load batches
 being whatever trickled in since the last lane freed up. Postgres pays a fixed cost per statement execution, and a
 batch of a few hundred requests splits it a few hundred ways; everything requests have in common (the newest page,
 the tag list, a viral article's favorite count and comment thread) is read once per batch instead of once per
-request. Feeds, the slowest read, have a quarter of the lanes to themselves, so other reads never wait for a feed in
-their batch. Pushing a request only wakes the collecting lane when its batch is ready, not on every request.
+request. Pushing a request only wakes the collecting lane when its batch is ready, not on every request.
 
 Nothing outlives its batch: every value in a response was read from Postgres while that request was waiting, and
 only requests already queued when the batch started share it.
@@ -76,9 +75,7 @@ unfavorites, follows, unfollows and new comments in a group are put next to thei
 loads, and interleaving independent hashes lets the core overlap them. How many lanes pay off depends on the CPU
 (its L1 and registers hold a few 4 KB S-box sets, not many), so at startup the server times widths 1 to 6 on throwaway
 keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
-worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. The hashing threads run
-under `SCHED_IDLE`: they only use CPU nothing else wants. A normal-priority thread hashes whatever has waited a
-second, so logins still finish on a box with no idle time. Every hash still does all
+worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
 2^10 rounds; logins always verify against the stored hash.
 
 **Postgres session settings** (startup parameters on its own connections, nothing server-wide):
@@ -120,11 +117,11 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
 | `BCRYPT_WINDOW_MS` | 400 | how long the first bcrypt thread waits to fill its lanes |
 | `READ_WINDOW_US` | 40000 | the longest the oldest request waits for its batch to fill |
-| `FEED_LANES` | read lanes / 4 | read lanes that serve only feeds (0: all lanes serve every read) |
+| `FEED_LANES` | 0 | read lanes that serve only feeds (0: all lanes serve every read) |
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
-| `BCRYPT_IDLE` | 1 | hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
+| `BCRYPT_IDLE` | 0 | 1: hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
 | `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
@@ -143,10 +140,10 @@ Postgres connections: `READ_LANES + WRITE_LANES` (9 by default).
 
 Ideas from other entries: the shared feed hubs (followees checked once per batch for 1,000+ articles, and their
 depth-th newest id as a floor) from `rust-epoll-theCatWisel` (#105), which credits the heavy-author count to earlier
-entries (#61, #100); feeds in batches of their own and long gathers from #117; one read of the tags table per batch
+entries (#61, #100); long gathers from #117; one read of the tags table per batch
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
-merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Idle-priority bcrypt, leaving quick-ack mode after each response and
+merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Leaving quick-ack mode after each response and
 group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117).
 
 Built with Claude (Anthropic).
