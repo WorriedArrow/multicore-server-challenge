@@ -60,8 +60,8 @@ only requests already queued when the batch started share it.
 makes them one implicit transaction (no `BEGIN`/`COMMIT` statements), committed at the `Sync` with one WAL flush;
 responses are released only after Postgres reports it done. If any statement in a group fails, the group rolls back
 and each write is retried on its own, so one bad write can't fail the others. A write whose commit outcome is unknown
-(connection lost) is never retried. Consecutive favorites,
-unfavorites, follows, unfollows or new comments in a group run as one statement over arrays of their parameters
+(connection lost) is never retried. A write waits up to 3 ms for company. Favorites,
+unfavorites, follows, unfollows and new comments in a group are put next to their own kind and each kind runs as one statement over arrays of their parameters
 (new comment ids drawn in request order), and its rows are split back per request. Writes that return an article
 (favorite, create, update) read it through the read lanes after the commit, in a new snapshot.
 
@@ -116,6 +116,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `FEED_LANES` | read lanes / 4 | read lanes that serve only feeds (0: all lanes serve every read) |
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
+| `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
 | `BCRYPT_IDLE` | 1 | hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |

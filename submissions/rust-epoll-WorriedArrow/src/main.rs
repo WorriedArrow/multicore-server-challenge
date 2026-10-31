@@ -59,6 +59,7 @@ fn main() {
         read_min: env_or("READ_MIN", 4096),
         read_window: Duration::from_micros(env_or("READ_WINDOW_US", 40_000)),
         write_batch: env_or("WRITE_BATCH", 256),
+        write_window: Duration::from_micros(env_or("WRITE_WINDOW_US", 3_000)),
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
         bcrypt_idle: env_or("BCRYPT_IDLE", 1) != 0,

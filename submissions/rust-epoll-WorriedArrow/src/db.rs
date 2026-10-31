@@ -117,6 +117,7 @@ pub struct Settings {
     pub read_min: usize,
     pub read_window: Duration,
     pub write_batch: usize,
+    pub write_window: Duration,
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
@@ -273,24 +274,27 @@ pub struct ReadLane {
     conn: Option<Conn>,
     s: &'static Settings,
     pool: &'static Pool,
+    /// Requests of the current batch already answered (before phase B), so a later failure doesn't answer them twice.
+    answered: Vec<ReplyTo>,
 }
 
 const LIST_STMTS: [&str; 3] = ["tag", "author", "favlist"];
 
 impl ReadLane {
     pub fn new(s: &'static Settings, pool: &'static Pool) -> ReadLane {
-        ReadLane { conn: None, s, pool }
+        ReadLane { conn: None, s, pool, answered: Vec::new() }
     }
 
-    fn conn(&mut self) -> pg::Result<&mut Conn> {
-        if self.conn.is_none() {
-            let mut c = Conn::connect(&self.s.cfg)?;
+    /// The lane's connection, (re)opened on demand (borrows only that field).
+    fn conn_of<'c>(conn: &'c mut Option<Conn>, s: &Settings) -> pg::Result<&'c mut Conn> {
+        if conn.is_none() {
+            let mut c = Conn::connect(&s.cfg)?;
             let stmts = crate::sql::read_statements();
             let list: Vec<(&str, &str, &[u32])> = stmts.iter().map(|s| (s.name, s.sql.as_str(), s.types)).collect();
             c.prepare_all(&list)?;
-            self.conn = Some(c);
+            *conn = Some(c);
         }
-        Ok(self.conn.as_mut().unwrap())
+        Ok(conn.as_mut().unwrap())
     }
 
     pub fn run(mut self) {
@@ -321,16 +325,19 @@ impl ReadLane {
                 }
             }
             let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
+            self.answered.clear();
             let res = self.batch(batch);
             if let Err(e) = res {
                 eprintln!("read batch failed: {e}");
                 self.conn = None;
-                reply::send_all(tos.into_iter().map(|t| reply::error(t, 500, "internal error")).collect());
+                let done = |t: &ReplyTo| self.answered.iter().any(|a| (a.thread, a.slot, a.generation) == (t.thread, t.slot, t.generation));
+                let left: Vec<Response> = tos.iter().filter(|t| !done(t)).map(|&t| reply::error(t, 500, "internal error")).collect();
+                reply::send_all(left);
             }
         }
     }
 
-    fn batch(&mut self, jobs: Vec<ReadJob>) -> pg::Result<()> {
+    fn batch(&mut self, mut jobs: Vec<ReadJob>) -> pg::Result<()> {
         // ---- distinct keys ----
         let mut want_tags = false;
         let mut uid: Keys<i64> = Keys::new();
@@ -372,7 +379,7 @@ impl ReadLane {
             .collect();
 
         // ---- phase A ----
-        let conn = self.conn()?;
+        let conn = Self::conn_of(&mut self.conn, self.s)?;
         let mut n = 0usize;
         let mut slot = |cond: bool| -> Option<usize> {
             if cond {
@@ -388,6 +395,7 @@ impl ReadLane {
         let s_uid = slot(uid.len() > 0);
         let s_uemail = slot(uemail.len() > 0);
         let s_prof = slot(prof.len() > 0);
+        let n_after_prof = s_tags.is_some() as usize + s_uid.is_some() as usize + s_uemail.is_some() as usize + s_prof.is_some() as usize;
         let s_aslug = slot(aslug.len() > 0);
         let s_aid = slot(aid.len() > 0);
         let s_cmts = slot(cmts.len() > 0);
@@ -409,6 +417,10 @@ impl ReadLane {
         if s_prof.is_some() {
             o.bind_exec("prof", &[Param::Raw(&texts(&prof))]);
         }
+        // First Sync: the tag list, current users and login lookups are answered from these alone, right away,
+        // instead of waiting for the rest of the batch and its phase B.
+        let n_early = n_after_prof;
+        o.sync();
         if s_aslug.is_some() {
             o.bind_exec("aslug", &[Param::Raw(&texts(&aslug))]);
         }
@@ -451,15 +463,81 @@ impl ReadLane {
         }
         o.sync();
         conn.flush()?;
-        let pa = conn.read_pipeline(n)?;
+        let mut pa = conn.read_pipeline(n_early)?;
+        if let Some(r) = pa.results.iter().find(|r| r.error.is_some()) {
+            return Err(pg::Error::Protocol(format!("phase A: {}", r.error.as_ref().unwrap())));
+        }
+        let mut done = vec![false; jobs.len()];
+        {
+            let g_uid = s_uid.map(|s| group(&pa, s, uid.len())).unwrap_or_default();
+            let g_uemail = s_uemail.map(|s| group(&pa, s, uemail.len())).unwrap_or_default();
+            let mut early: Vec<Response> = Vec::new();
+            let mut tags_body: Option<Vec<u8>> = None;
+            for (i, (j, a)) in jobs.iter_mut().zip(asks.iter()).enumerate() {
+                let to = j.to;
+                match *a {
+                    Ask::Tags => {
+                        // One body for every tag-list request of the batch.
+                        let b = tags_body.get_or_insert_with(|| {
+                            let s = s_tags.unwrap();
+                            let mut b = Vec::with_capacity(4096);
+                            b.extend_from_slice(b"{\"tags\":[");
+                            for (i, r) in pa.results[s].rows.iter().enumerate() {
+                                if i > 0 {
+                                    b.push(b',');
+                                }
+                                json::str(&mut b, pa.bytes(r[1]).unwrap_or(b""));
+                            }
+                            b.extend_from_slice(b"]}");
+                            b
+                        });
+                        early.push(Response { to, status: 200, body: b.clone() });
+                    }
+                    Ask::User(k) => {
+                        let Read::CurrentUser { token, .. } = &j.kind else { unreachable!() };
+                        match g_uid[k as usize].first() {
+                            Some(&i) => {
+                                let r = &pa.results[s_uid.unwrap()].rows[i];
+                                let mut b = Vec::with_capacity(512);
+                                user_json(&mut b, pa.bytes(r[3]).unwrap_or(b""), token.as_bytes(), pa.bytes(r[2]).unwrap_or(b""), pa.bytes(r[4]), pa.bytes(r[5]));
+                                early.push(Response { to, status: 200, body: b });
+                            }
+                            None => early.push(reply::error(to, 401, "unauthorized")),
+                        }
+                    }
+                    Ask::Login(k) => {
+                        let Read::Login { password, .. } = &mut j.kind else { unreachable!() };
+                        let password = std::mem::take(password);
+                        match g_uemail[k as usize].first() {
+                            Some(&i) => {
+                                let r = &pa.results[s_uemail.unwrap()].rows[i];
+                                let user = UserOut {
+                                    id: pa.i64(r[1]),
+                                    username: owned(&pa, r[2]).unwrap_or_default(),
+                                    email: owned(&pa, r[3]).unwrap_or_default(),
+                                    bio: owned(&pa, r[4]),
+                                    image: owned(&pa, r[5]),
+                                };
+                                let hash = owned(&pa, r[6]).unwrap_or_default();
+                                BCRYPT.push_all(BcryptJob::Verify { password, hash, user, to });
+                            }
+                            None => early.push(reply::error(to, 401, "invalid email or password")),
+                        }
+                    }
+                    _ => continue,
+                }
+                done[i] = true;
+                self.answered.push(to);
+            }
+            reply::send_all(early);
+        }
+        conn.read_pipeline_into(&mut pa, n - n_early)?;
         if let Some(r) = pa.results.iter().find(|r| r.error.is_some()) {
             return Err(pg::Error::Protocol(format!("phase A: {}", r.error.as_ref().unwrap())));
         }
 
         // ---- decode phase A ----
         let g = |slot: Option<usize>, n: usize| slot.map(|s| group(&pa, s, n)).unwrap_or_default();
-        let g_uid = g(s_uid, uid.len());
-        let g_uemail = g(s_uemail, uemail.len());
         let g_prof = g(s_prof, prof.len());
         let g_cmts = g(s_cmts, cmts.len());
         let first_row = |slot: Option<usize>, n: usize| -> Vec<Option<ArtRef>> {
@@ -639,53 +717,14 @@ impl ReadLane {
 
         // ---- assemble ----
         let mut out: Vec<Response> = Vec::with_capacity(jobs.len());
-        for (j, ask) in jobs.into_iter().zip(asks.into_iter()) {
+        for ((j, ask), done) in jobs.into_iter().zip(asks.into_iter()).zip(done) {
+            if done {
+                continue;
+            }
             let v = j.viewer;
             let to = j.to;
             match ask {
-                Ask::Tags => {
-                    let s = s_tags.unwrap();
-                    let mut b = Vec::with_capacity(4096);
-                    b.extend_from_slice(b"{\"tags\":[");
-                    for (i, r) in pa.results[s].rows.iter().enumerate() {
-                        if i > 0 {
-                            b.push(b',');
-                        }
-                        json::str(&mut b, pa.bytes(r[1]).unwrap_or(b""));
-                    }
-                    b.extend_from_slice(b"]}");
-                    out.push(Response { to, status: 200, body: b });
-                }
-                Ask::User(k) => {
-                    let Read::CurrentUser { token, .. } = j.kind else { unreachable!() };
-                    match g_uid[k as usize].first() {
-                        Some(&i) => {
-                            let r = &pa.results[s_uid.unwrap()].rows[i];
-                            let mut b = Vec::with_capacity(512);
-                            user_json(&mut b, pa.bytes(r[3]).unwrap_or(b""), token.as_bytes(), pa.bytes(r[2]).unwrap_or(b""), pa.bytes(r[4]), pa.bytes(r[5]));
-                            out.push(Response { to, status: 200, body: b });
-                        }
-                        None => out.push(reply::error(to, 401, "unauthorized")),
-                    }
-                }
-                Ask::Login(k) => {
-                    let Read::Login { password, .. } = j.kind else { unreachable!() };
-                    match g_uemail[k as usize].first() {
-                        Some(&i) => {
-                            let r = &pa.results[s_uemail.unwrap()].rows[i];
-                            let user = UserOut {
-                                id: pa.i64(r[1]),
-                                username: owned(&pa, r[2]).unwrap_or_default(),
-                                email: owned(&pa, r[3]).unwrap_or_default(),
-                                bio: owned(&pa, r[4]),
-                                image: owned(&pa, r[5]),
-                            };
-                            let hash = owned(&pa, r[6]).unwrap_or_default();
-                            BCRYPT.push_all(BcryptJob::Verify { password, hash, user, to });
-                        }
-                        None => out.push(reply::error(to, 401, "invalid email or password")),
-                    }
-                }
+                Ask::Tags | Ask::User(_) | Ask::Login(_) => unreachable!("answered after the first Sync"),
                 Ask::Profile(k) => match g_prof[k as usize].first() {
                     Some(&i) => {
                         let r = &pa.results[s_prof.unwrap()].rows[i];
@@ -1015,7 +1054,19 @@ impl WriteLane {
         let mut jobs = Vec::with_capacity(self.s.write_batch);
         loop {
             jobs.clear();
-            WRITES.take(self.s.write_batch, &mut jobs);
+            // A few milliseconds for company: a group commits with one WAL flush however many writes it holds.
+            WRITES.take_gather(self.s.write_batch, self.s.write_window, &mut jobs);
+            // Same kinds next to each other, so each kind runs as one merged statement. Every write in a group was
+            // in flight at the same time (a client sends its next request only after this one is answered), so any
+            // order is one they could have committed in; the sort is stable within a kind.
+            jobs.sort_by_key(|j| match merged_stmt(j) {
+                Some("fav_n") => 0,
+                Some("unfav_n") => 1,
+                Some("follow_n") => 2,
+                Some("unfollow_n") => 3,
+                Some(_) => 4,
+                None => 5,
+            });
             let batch = std::mem::take(&mut jobs);
             if let Err((e, left)) = self.group(batch) {
                 eprintln!("write batch failed: {e}");

@@ -267,7 +267,7 @@ pub fn write_statements() -> Vec<Stmt> {
             "WITH r AS MATERIALIZED (SELECT x.k, x.uid, x.body, a.id AS aid \
                FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
                JOIN articles a ON a.slug = x.slug ORDER BY x.k), \
-             ids AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval(pg_get_serial_sequence('comments', 'id')) AS id \
+             ids AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval('comments_id_seq'::regclass) AS id \
                FROM (SELECT * FROM r ORDER BY k OFFSET 0) s), \
              c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT id, aid, uid, body FROM ids \
                RETURNING id, body, created_at, updated_at, author_id) \
@@ -280,7 +280,7 @@ pub fn write_statements() -> Vec<Stmt> {
             format!(
                 "INSERT INTO articles (id, slug, author_id, title, description, body) \
                  SELECT n.id, {SLUGIFY} || '-' || n.id, $1, $2, $3, $4 \
-                 FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n RETURNING id"
+                 FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id"
             ),
             &[crate::pg::INT8, crate::pg::TEXT, crate::pg::TEXT, crate::pg::TEXT],
         ),
@@ -293,7 +293,7 @@ pub fn write_statements() -> Vec<Stmt> {
         s(
             "arttags",
             "INSERT INTO article_tags (article_id, tag_id) \
-             SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])",
+             SELECT currval('articles_id_seq'::regclass), t.id FROM tags t WHERE t.name = ANY($1::text[])",
             &[TEXT_ARRAY],
         ),
         s(

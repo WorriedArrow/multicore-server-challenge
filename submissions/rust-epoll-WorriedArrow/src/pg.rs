@@ -503,8 +503,16 @@ impl Conn {
     /// Reads results until ReadyForQuery. One StmtResult per Execute (and per Describe/Parse pair is ignored).
     /// `n_exec` = how many Execute messages were sent, so skipped statements after an error still get a slot.
     pub fn read_pipeline(&mut self, n_exec: usize) -> Result<Pipeline> {
-        let mut data = Vec::with_capacity(4096);
-        let mut results: Vec<StmtResult> = Vec::with_capacity(n_exec);
+        let mut p = Pipeline { data: Vec::with_capacity(4096), results: Vec::with_capacity(n_exec) };
+        self.read_pipeline_into(&mut p, n_exec)?;
+        Ok(p)
+    }
+
+    /// Reads the results of `n_exec` more executions, up to their ReadyForQuery, appending to `p`.
+    pub fn read_pipeline_into(&mut self, p: &mut Pipeline, n_exec: usize) -> Result<()> {
+        let n_exec = p.results.len() + n_exec;
+        let data = &mut p.data;
+        let results = &mut p.results;
         let mut cur: Vec<Vec<Col>> = Vec::new();
         loop {
             let (tag, body) = self.read_msg()?;
@@ -542,7 +550,7 @@ impl Conn {
                 error: Some(DbError { code: "skipped".into(), message: "skipped after an earlier error".into() }),
             });
         }
-        Ok(Pipeline { data, results })
+        Ok(())
     }
 
     /// Prepares named statements (Parse + Sync), failing on the first error.
