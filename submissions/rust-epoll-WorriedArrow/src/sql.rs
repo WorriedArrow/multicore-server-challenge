@@ -307,13 +307,14 @@ pub fn write_statements() -> Vec<Stmt> {
             &[TEXT_ARRAY],
         ),
         // A new article's response row, read in its own transaction after "newart" (and its tags): currval is the id
-        // that "newart" drew in this session.
+        // that "newart" drew in this session. In a subquery, so the planner probes the primary key with it: a volatile
+        // call compared directly against a column can't be an index condition.
         s(
             "artout",
             "SELECT a.id, a.slug, a.created_at, a.updated_at, u.username, u.bio, u.image, \
              ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
              EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = $1) \
-             FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = currval('articles_id_seq'::regclass)",
+             FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT currval('articles_id_seq'::regclass))",
             &[crate::pg::INT8],
         ),
         s(
