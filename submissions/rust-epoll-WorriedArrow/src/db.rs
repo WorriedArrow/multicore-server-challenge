@@ -170,6 +170,16 @@ impl<K: Hash + Eq + Clone> Keys<K> {
     }
 }
 
+impl Keys<String> {
+    /// Like `idx`, copying the key only the first time it is seen.
+    fn idx_str(&mut self, key: &str) -> u32 {
+        if let Some(&i) = self.map.get(key) {
+            return i;
+        }
+        self.idx(key.to_owned())
+    }
+}
+
 /// Rows of a statement result grouped by their `k` (column 0), as row indices.
 fn group(p: &Pipeline, res: usize, n: usize) -> Vec<Vec<usize>> {
     let mut g = vec![Vec::new(); n];
@@ -256,7 +266,8 @@ enum Ask {
 /// Distinct keys of one filtered list kind.
 struct ListKeys {
     count: Keys<String>,
-    page: Keys<(String, i64, i64)>,
+    /// (index of the key in `count`, limit, offset)
+    page: Keys<(u32, i64, i64)>,
 }
 
 impl ListKeys {
@@ -359,11 +370,11 @@ impl ReadLane {
                     Ask::Tags
                 }
                 Read::CurrentUser { id, .. } => Ask::User(uid.idx(*id)),
-                Read::Login { email, .. } => Ask::Login(uemail.idx(email.clone())),
-                Read::Profile { username } => Ask::Profile(prof.idx(username.clone())),
-                Read::Article { slug } => Ask::Slug(aslug.idx(slug.clone())),
+                Read::Login { email, .. } => Ask::Login(uemail.idx_str(email)),
+                Read::Profile { username } => Ask::Profile(prof.idx_str(username)),
+                Read::Article { slug } => Ask::Slug(aslug.idx_str(slug)),
                 Read::ArticleId { id, .. } => Ask::Id(aid.idx(*id)),
-                Read::Comments { slug } => Ask::Comments(cmts.idx(slug.clone())),
+                Read::Comments { slug } => Ask::Comments(cmts.idx_str(slug)),
                 Read::Global { lim, off } => Ask::Global(global.idx((*lim, *off))),
                 Read::Tag { tag: key, lim, off } | Read::Author { username: key, lim, off } | Read::Favorited { username: key, lim, off } => {
                     let f = match &j.kind {
@@ -372,7 +383,8 @@ impl ReadLane {
                         _ => 2,
                     };
                     let l = &mut lists[f];
-                    Ask::List(f, l.count.idx(key.clone()), l.page.idx((key.clone(), *lim, *off)))
+                    let c = l.count.idx_str(key);
+                    Ask::List(f, c, l.page.idx((c, *lim, *off)))
                 }
                 Read::Feed { lim, off } => Ask::Feed(feed.idx(j.viewer), feedpage.idx((j.viewer, *lim, *off))),
             })
@@ -443,7 +455,7 @@ impl ReadLane {
                     LIST_STMTS[f],
                     &[
                         Param::Raw(&texts(&l.count)),
-                        Param::Raw(&text_array(l.page.list.iter().map(|k| k.0.as_bytes()))),
+                        Param::Raw(&text_array(l.page.list.iter().map(|k| l.count.list[k.0 as usize].as_bytes()))),
                         Param::Raw(&int_array(l.page.list.iter().map(|k| k.1))),
                         Param::Raw(&int_array(l.page.list.iter().map(|k| k.2))),
                     ],
@@ -803,7 +815,7 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&Vec<Col>> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && r[7].len >= 0).collect();
+                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && r[7].len >= 0).collect();
                     list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
