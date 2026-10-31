@@ -148,6 +148,7 @@ from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from severa
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
 merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Leaving quick-ack mode after each response and
 group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117), whose `asm_gen.zig` the generated bcrypt
-kernel is a port of.
+kernel is a port of. Answering article creation from its own insert and carrying a favorite's known state into its read-back from
+`rust-epoll-theCatWisel` (#154).
 
 Built with Claude (Anthropic).

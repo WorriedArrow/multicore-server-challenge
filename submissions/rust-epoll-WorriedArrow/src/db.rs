@@ -133,9 +133,17 @@ impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0
     }
+    // Eight bytes per step: slugs, usernames and emails are tens of bytes long.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c {
+            self.write_u64(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        let r = c.remainder();
+        if !r.is_empty() {
+            let mut t = [0u8; 8];
+            t[..r.len()].copy_from_slice(r);
+            self.write_u64(u64::from_le_bytes(t) ^ ((r.len() as u64) << 56));
         }
     }
     fn write_u64(&mut self, v: u64) {
@@ -161,6 +169,10 @@ impl<K: Hash + Eq + Clone> Keys<K> {
         if let Some(&i) = self.map.get(&key) {
             return i;
         }
+        self.add(key)
+    }
+    /// Adds a key known to be new.
+    fn add(&mut self, key: K) -> u32 {
         let i = self.list.len() as u32;
         self.map.insert(key.clone(), i);
         self.list.push(key);
@@ -177,7 +189,7 @@ impl Keys<String> {
         if let Some(&i) = self.map.get(key) {
             return i;
         }
-        self.idx(key.to_owned())
+        self.add(key.to_owned())
     }
 }
 
@@ -841,11 +853,20 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[1].len >= 0 && auser.contains_key(&pa.i64(r[5]))).collect();
-                    list.sort_unstable_by(|x, y| (pa.i64(y[3]), pa.i64(y[1])).cmp(&(pa.i64(x[3]), pa.i64(x[1]))));
+                    // Each comment with its author's row, looked up once.
+                    let mut list: Vec<(&[Col], &[Col])> = rows
+                        .iter()
+                        .map(|&i| &pa.results[s].rows[i][..])
+                        .filter(|r| r[1].len >= 0)
+                        .filter_map(|r| auser.get(&pa.i64(r[5])).map(|&u| (r, u)))
+                        .collect();
+                    // Already newest first from the statement; sorting a sorted run is linear.
+                    list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[3]), pa.i64(y[1])).cmp(&(pa.i64(x[3]), pa.i64(x[1]))));
+                    // Some whenever a comment is listed: its author came from phase B's "auser".
+                    let pbr = pb.as_ref();
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
-                    for (n, r) in list.into_iter().enumerate() {
+                    for (n, (r, u)) in list.into_iter().enumerate() {
                         if n > 0 {
                             b.push(b',');
                         }
@@ -859,7 +880,7 @@ impl ReadLane {
                         json::str(&mut b, pa.bytes(r[2]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
                         let following = v != 0 && ctx.following(v, pa.i64(r[5]));
-                        let (u, pb) = (auser[&pa.i64(r[5])], pb.as_ref().unwrap());
+                        let pb = pbr.unwrap();
                         profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
@@ -1038,8 +1059,8 @@ fn write_plan(w: &WriteJob) -> Vec<&'static str> {
         Write::Follow { on: false, .. } => vec!["unfollow"],
         Write::Favorite { on: true, .. } => vec!["fav"],
         Write::Favorite { on: false, .. } => vec!["unfav"],
-        Write::CreateArticle { tags, .. } if tags.is_empty() => vec!["newart", "artout"],
-        Write::CreateArticle { .. } => vec!["newart", "newtags", "arttags", "artout"],
+        Write::CreateArticle { tags, .. } if tags.is_empty() => vec!["newart"],
+        Write::CreateArticle { .. } => vec!["newart", "newtags", "arttags"],
         Write::UpdateArticle { .. } => vec!["updart"],
         Write::DeleteArticle { .. } => vec!["delart"],
         Write::CreateComment { .. } => vec!["newcmt"],
@@ -1107,16 +1128,21 @@ fn bind_write(o: &mut pg::Out, w: &WriteJob) {
         }
         Write::Favorite { slug, on } => o.bind_exec(if *on { "fav" } else { "unfav" }, &[Param::I64(v), Param::Text(slug.as_bytes())]),
         Write::CreateArticle { title, description, body, tags } => {
+            let arr = text_array(tags.iter().map(|t| t.as_bytes()));
             o.bind_exec(
                 "newart",
-                &[Param::I64(v), Param::Text(title.as_bytes()), Param::Text(description.as_bytes()), Param::Text(body.as_bytes())],
+                &[
+                    Param::I64(v),
+                    Param::Text(title.as_bytes()),
+                    Param::Text(description.as_bytes()),
+                    Param::Text(body.as_bytes()),
+                    Param::Raw(&arr),
+                ],
             );
             if !tags.is_empty() {
-                let arr = text_array(tags.iter().map(|t| t.as_bytes()));
                 o.bind_exec("newtags", &[Param::Raw(&arr)]);
                 o.bind_exec("arttags", &[Param::Raw(&arr)]);
             }
-            o.bind_exec("artout", &[Param::I64(v)]);
         }
         Write::UpdateArticle { slug, title, description, body } => o.bind_exec(
             "updart",
@@ -1267,8 +1293,7 @@ fn finish_write(j: WriteJob, p: &Pipeline, start: usize, k: usize, s: &Settings,
         }
         return;
     }
-    let row = if matches!(j.kind, Write::CreateArticle { .. }) { k - 1 } else { 0 };
-    finish_row(j, p, results[row].rows.first().map(|r| &r[..]), s, out);
+    finish_row(j, p, results[0].rows.first().map(|r| &r[..]), s, out);
 }
 
 /// Answers a committed write from its first result row (None: no row).
@@ -1308,7 +1333,7 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
             Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200, fav: Some(on) }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
-        // A new article's whole response comes from the request and the "artout" row its own pipeline ends with: no
+        // A new article's whole response comes from the request and the row "newart" returns: no
         // favorites yet, so favorited is false and favoritesCount 0.
         Write::CreateArticle { title, description, body, .. } => match first {
             Some(r) => {
