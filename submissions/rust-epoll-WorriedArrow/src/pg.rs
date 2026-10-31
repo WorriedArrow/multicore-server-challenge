@@ -350,8 +350,6 @@ pub struct Conn {
     rpos: usize,
     rend: usize,
     pub out: Out,
-    /// Size of the last pipeline's data, to allocate the next one at once instead of growing it.
-    last_data: usize,
 }
 
 fn h(data: &[u8]) -> [u8; 32] {
@@ -378,7 +376,7 @@ impl Conn {
     pub fn connect(cfg: &Config) -> Result<Conn> {
         let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
         stream.set_nodelay(true)?;
-        let mut c = Conn { stream, rbuf: vec![0; 64 * 1024], rpos: 0, rend: 0, out: Out::default(), last_data: 4096 };
+        let mut c = Conn { stream, rbuf: vec![0; 64 * 1024], rpos: 0, rend: 0, out: Out::default() };
         // StartupMessage
         let mut m = Vec::new();
         m.extend_from_slice(&0i32.to_be_bytes());
@@ -559,7 +557,7 @@ impl Conn {
     /// Reads results until ReadyForQuery. One StmtResult per Execute (and per Describe/Parse pair is ignored).
     /// `n_exec` = how many Execute messages were sent, so skipped statements after an error still get a slot.
     pub fn read_pipeline(&mut self, n_exec: usize) -> Result<Pipeline> {
-        let mut p = Pipeline { data: Vec::with_capacity(self.last_data), results: Vec::with_capacity(n_exec) };
+        let mut p = Pipeline { data: Vec::with_capacity(4096), results: Vec::with_capacity(n_exec) };
         self.read_pipeline_into(&mut p, n_exec)?;
         Ok(p)
     }
@@ -604,7 +602,6 @@ impl Conn {
                 other => return Err(Error::Protocol(format!("unexpected message {:?}", other as char))),
             }
         }
-        self.last_data = data.len().clamp(4096, 64 << 20);
         // Statements skipped after an error report nothing; mark them as failed too.
         while results.len() < n_exec {
             results.push(StmtResult {
