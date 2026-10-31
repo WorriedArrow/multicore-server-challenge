@@ -678,6 +678,18 @@ impl ReadLane {
             }
         }
 
+        // Every comment's author, sorted and distinct.
+        let mut cauth: Vec<i64> = Vec::new();
+        if let Some(s) = s_cmts {
+            for r in &pa.results[s].rows {
+                if r[2].len >= 0 {
+                    cauth.push(pa.i64(r[6]));
+                }
+            }
+        }
+        cauth.sort_unstable();
+        cauth.dedup();
+
         // ---- phase B ----
         let mut nb = 0usize;
         let mut slotb = |cond: bool| -> Option<usize> {
@@ -691,6 +703,7 @@ impl ReadLane {
         let b_artx = slotb(arts.len() > 0);
         let b_flags = slotb(favd.len() + foll.len() > 0);
         let b_rows = slotb(need_rows.len() > 0);
+        let b_auser = slotb(!cauth.is_empty());
         let pb = if nb > 0 {
             let ids = int_array(arts.list.iter().copied());
             let o = &mut conn.out;
@@ -710,6 +723,9 @@ impl ReadLane {
             }
             if b_rows.is_some() {
                 o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
+            }
+            if b_auser.is_some() {
+                o.bind_exec("auser", &[Param::Raw(&int_array(cauth.iter().copied()))]);
             }
             o.sync();
             conn.flush()?;
@@ -747,6 +763,12 @@ impl ReadLane {
                         target[k as usize] = true;
                     }
                 }
+            }
+        }
+        let mut auser: FxMap<i64, &[Col]> = FxMap::default();
+        if let (Some(pb), Some(s)) = (&pb, b_auser) {
+            for r in &pb.results[s].rows {
+                auser.insert(pb.i64(r[0]), &r[..]);
             }
         }
         let mut rows_b: FxMap<i64, usize> = FxMap::default();
@@ -815,7 +837,7 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && r[7].len >= 0).collect();
+                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && auser.contains_key(&pa.i64(r[6]))).collect();
                     list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
@@ -833,7 +855,8 @@ impl ReadLane {
                         json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
                         let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        profile_obj(&mut b, pa.bytes(r[7]).unwrap_or(b""), pa.bytes(r[8]), pa.bytes(r[9]), following);
+                        let (u, pb) = (auser[&pa.i64(r[6])], pb.as_ref().unwrap());
+                        profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
                     b.extend_from_slice(b"]}");
