@@ -589,14 +589,18 @@ impl ReadLane {
         let mut art_author: Vec<i64> = Vec::new();
         let mut favd: Keys<(i64, i64)> = Keys::new();
         let mut foll: Keys<(i64, i64)> = Keys::new();
-        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: &mut Keys<(i64, i64)>| {
+        // Article rows phase A returned with their columns (everything but feed pages), by id.
+        let mut full: FxMap<i64, &[Col]> = FxMap::default();
+        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: Option<&mut Keys<(i64, i64)>>| {
             let i = arts.idx(id) as usize;
             if art_author.len() <= i {
                 art_author.push(author);
             }
             if v != 0 {
                 favd.idx((v, id));
-                foll.idx((v, author));
+                if let Some(foll) = foll {
+                    foll.idx((v, author));
+                }
             }
         };
         for (j, a) in jobs.iter().zip(asks.iter()) {
@@ -604,23 +608,27 @@ impl ReadLane {
             match *a {
                 Ask::Slug(k) | Ask::Id(k) => {
                     let p = if let Ask::Slug(_) = a { by_slug[k as usize] } else { by_id[k as usize] };
-                    if let Some((id, author, _)) = p {
-                        add_art(id, author, v, &mut arts, &mut favd, &mut foll);
+                    if let Some((id, author, r)) = p {
+                        full.entry(id).or_insert(r);
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
                     }
                 }
                 Ask::Global(p) => {
-                    for &(id, author, _) in &gpages[p as usize] {
-                        add_art(id, author, v, &mut arts, &mut favd, &mut foll);
+                    for &(id, author, r) in &gpages[p as usize] {
+                        full.entry(id).or_insert(r);
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
                     }
                 }
                 Ask::List(f, _, p) => {
-                    for &(id, author, _) in &decoded[f].1[p as usize] {
-                        add_art(id, author, v, &mut arts, &mut favd, &mut foll);
+                    for &(id, author, r) in &decoded[f].1[p as usize] {
+                        full.entry(id).or_insert(r);
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
                     }
                 }
                 Ask::Feed(_, p) => {
+                    // A feed's articles are by authors the viewer follows: no follow probe needed.
                     for &(id, author, _) in &fpages[p as usize] {
-                        add_art(id, author, v, &mut arts, &mut favd, &mut foll);
+                        add_art(id, author, v, &mut arts, &mut favd, None);
                     }
                 }
                 Ask::Comments(k) => {
@@ -646,6 +654,18 @@ impl ReadLane {
             }
         }
 
+        // Feed articles no other phase-A row brought columns for.
+        let mut need_rows: Keys<i64> = Keys::new();
+        for a in &asks {
+            if let Ask::Feed(_, p) = *a {
+                for &(id, _, _) in &fpages[p as usize] {
+                    if !full.contains_key(&id) {
+                        need_rows.idx(id);
+                    }
+                }
+            }
+        }
+
         // ---- phase B ----
         let mut nb = 0usize;
         let mut slotb = |cond: bool| -> Option<usize> {
@@ -658,6 +678,7 @@ impl ReadLane {
         };
         let b_artx = slotb(arts.len() > 0);
         let b_flags = slotb(favd.len() + foll.len() > 0);
+        let b_rows = slotb(need_rows.len() > 0);
         let pb = if nb > 0 {
             let ids = int_array(arts.list.iter().copied());
             let o = &mut conn.out;
@@ -674,6 +695,9 @@ impl ReadLane {
                         Param::Raw(&int_array(foll.list.iter().map(|p| p.1))),
                     ],
                 );
+            }
+            if b_rows.is_some() {
+                o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
             }
             o.sync();
             conn.flush()?;
@@ -713,7 +737,27 @@ impl ReadLane {
                 }
             }
         }
-        let ctx = Ctx { pb: pb.as_ref(), b_artx, arts: &arts, art_row: &art_row, tag_rank: &tag_rank, favd: &favd, foll: &foll, is_fav: &is_fav, is_foll: &is_foll, frags: Default::default() };
+        let mut rows_b: FxMap<i64, usize> = FxMap::default();
+        if let (Some(pb), Some(s)) = (&pb, b_rows) {
+            for (i, r) in pb.results[s].rows.iter().enumerate() {
+                rows_b.insert(pb.i64(r[1]), i);
+            }
+        }
+        let ctx = Ctx {
+            pb: pb.as_ref(),
+            b_artx,
+            b_rows,
+            arts: &arts,
+            art_row: &art_row,
+            full: &full,
+            rows_b: &rows_b,
+            tag_rank: &tag_rank,
+            favd: &favd,
+            foll: &foll,
+            is_fav: &is_fav,
+            is_foll: &is_foll,
+            frags: Default::default(),
+        };
 
         // ---- assemble ----
         let mut out: Vec<Response> = Vec::with_capacity(jobs.len());
@@ -745,7 +789,7 @@ impl ReadLane {
                     };
                     let mut b = Vec::with_capacity(2048);
                     b.extend_from_slice(b"{\"article\":");
-                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v)) {
+                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false)) {
                         b.push(b'}');
                         out.push(Response { to, status, body: b });
                     } else {
@@ -790,6 +834,8 @@ impl ReadLane {
                         Ask::Feed(c, p) => (&fpages[p as usize], fcount[c as usize]),
                         _ => unreachable!(),
                     };
+                    // A feed only holds articles by authors the viewer follows.
+                    let followed = matches!(ask, Ask::Feed(..)) && v != 0;
                     let mut b = Vec::with_capacity(512 + 700 * rows.len());
                     b.extend_from_slice(b"{\"articles\":[");
                     let mut first = true;
@@ -798,7 +844,7 @@ impl ReadLane {
                         if !first {
                             b.push(b',');
                         }
-                        if ctx.article(&mut b, &pa, a, false, v) {
+                        if ctx.article(&mut b, &pa, a, false, v, followed) {
                             first = false;
                         } else {
                             b.truncate(mark);
@@ -819,6 +865,10 @@ impl ReadLane {
 struct Ctx<'a> {
     pb: Option<&'a Pipeline>,
     b_artx: Option<usize>,
+    b_rows: Option<usize>,
+    /// Phase-A rows with columns, by article id, and phase-B "artrow" rows for the rest (feed pages).
+    full: &'a FxMap<i64, &'a [Col]>,
+    rows_b: &'a FxMap<i64, usize>,
     arts: &'a Keys<i64>,
     art_row: &'a [Option<usize>],
     tag_rank: &'a FxMap<i32, (u32, Col)>,
@@ -854,15 +904,23 @@ impl Ctx<'_> {
         let pb = self.pb?;
         let ri = self.arts.map.get(&id).and_then(|&k| self.art_row[k as usize])?;
         let r = &pb.results[self.b_artx.unwrap()].rows[ri];
+        // The article's own columns: from its phase-A row, another phase-A row for it, or phase B's "artrow".
+        let (src, ar): (&Pipeline, &[Col]) = if ar[3].len >= 0 {
+            (pa, ar)
+        } else if let Some(&row) = self.full.get(&id) {
+            (pa, row)
+        } else {
+            (pb, &pb.results[self.b_rows?].rows[*self.rows_b.get(&id)?][..])
+        };
         b.extend_from_slice(b"{\"slug\":");
-        json::str(b, pa.bytes(ar[3]).unwrap_or(b""));
+        json::str(b, src.bytes(ar[3]).unwrap_or(b""));
         b.extend_from_slice(b",\"title\":");
-        json::str(b, pa.bytes(ar[4]).unwrap_or(b""));
+        json::str(b, src.bytes(ar[4]).unwrap_or(b""));
         b.extend_from_slice(b",\"description\":");
-        json::str(b, pa.bytes(ar[5]).unwrap_or(b""));
+        json::str(b, src.bytes(ar[5]).unwrap_or(b""));
         if full {
             b.extend_from_slice(b",\"body\":");
-            json::str(b, pa.bytes(ar[8]).unwrap_or(b""));
+            json::str(b, src.bytes(ar[8]).unwrap_or(b""));
         }
         b.extend_from_slice(b",\"tagList\":[");
         if let Some(arr) = pb.bytes(r[1]) {
@@ -879,9 +937,9 @@ impl Ctx<'_> {
             }
         }
         b.extend_from_slice(b"],\"createdAt\":");
-        json::ts(b, pa.i64(ar[6]));
+        json::ts(b, src.i64(ar[6]));
         b.extend_from_slice(b",\"updatedAt\":");
-        json::ts(b, pa.i64(ar[7]));
+        json::ts(b, src.i64(ar[7]));
         b.extend_from_slice(b",\"favorited\":");
         let fav_at = b.len();
         b.extend_from_slice(b",\"favoritesCount\":");
@@ -898,7 +956,7 @@ impl Ctx<'_> {
 
     /// Writes one Article object for viewer `v`, from the batch's fragment for it. Returns false (writing nothing)
     /// if the article's phase-B row is missing.
-    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64) -> bool {
+    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64, followed: bool) -> bool {
         let (id, author, _) = a;
         let mut f = self.frags.borrow_mut();
         let f = &mut *f;
@@ -918,7 +976,7 @@ impl Ctx<'_> {
         b.extend_from_slice(&f.buf[start..fav]);
         json::bool(b, v != 0 && self.favorited(v, id));
         b.extend_from_slice(&f.buf[fav..foll]);
-        json::bool(b, v != 0 && self.following(v, author));
+        json::bool(b, followed || (v != 0 && self.following(v, author)));
         b.extend_from_slice(b"}}");
         true
     }
