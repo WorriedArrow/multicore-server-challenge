@@ -31,7 +31,8 @@ pub enum Read {
     Login { email: String, password: Vec<u8> },
     Profile { username: String },
     Article { slug: String },
-    ArticleId { id: i64, status: u16 },
+    /// A write's read-back; `fav`: the viewer's favorite state when the write just set it.
+    ArticleId { id: i64, status: u16, fav: Option<bool> },
     Comments { slug: String },
     Global { lim: i64, off: i64 },
     Tag { tag: String, lim: i64, off: i64 },
@@ -603,13 +604,15 @@ impl ReadLane {
         let mut foll: Keys<(i64, i64)> = Keys::new();
         // Article rows phase A returned with their columns (everything but feed pages), by id.
         let mut full: FxMap<i64, &[Col]> = FxMap::default();
-        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: Option<&mut Keys<(i64, i64)>>| {
+        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: Option<&mut Keys<(i64, i64)>>, ask_fav: bool| {
             let i = arts.idx(id) as usize;
             if art_author.len() <= i {
                 art_author.push(author);
             }
             if v != 0 {
-                favd.idx((v, id));
+                if ask_fav {
+                    favd.idx((v, id));
+                }
                 if let Some(foll) = foll {
                     foll.idx((v, author));
                 }
@@ -622,25 +625,26 @@ impl ReadLane {
                     let p = if let Ask::Slug(_) = a { by_slug[k as usize] } else { by_id[k as usize] };
                     if let Some((id, author, r)) = p {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        let known = matches!(j.kind, Read::ArticleId { fav: Some(_), .. });
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), !known);
                     }
                 }
                 Ask::Global(p) => {
                     for &(id, author, r) in &gpages[p as usize] {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), true);
                     }
                 }
                 Ask::List(f, _, p) => {
                     for &(id, author, r) in &decoded[f].1[p as usize] {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), true);
                     }
                 }
                 Ask::Feed(_, p) => {
                     // A feed's articles are by authors the viewer follows: no follow probe needed.
                     for &(id, author, _) in &fpages[p as usize] {
-                        add_art(id, author, v, &mut arts, &mut favd, None);
+                        add_art(id, author, v, &mut arts, &mut favd, None, true);
                     }
                 }
                 Ask::Comments(k) => {
@@ -648,8 +652,8 @@ impl ReadLane {
                         if let Some(s) = s_cmts {
                             for &i in &g_cmts[k as usize] {
                                 let r = &pa.results[s].rows[i];
-                                if r[2].len >= 0 {
-                                    foll.idx((v, pa.i64(r[6])));
+                                if r[1].len >= 0 {
+                                    foll.idx((v, pa.i64(r[5])));
                                 }
                             }
                         }
@@ -682,8 +686,8 @@ impl ReadLane {
         let mut cauth: Vec<i64> = Vec::new();
         if let Some(s) = s_cmts {
             for r in &pa.results[s].rows {
-                if r[2].len >= 0 {
-                    cauth.push(pa.i64(r[6]));
+                if r[1].len >= 0 {
+                    cauth.push(pa.i64(r[5]));
                 }
             }
         }
@@ -817,13 +821,13 @@ impl ReadLane {
                 },
                 Ask::Slug(k) | Ask::Id(k) => {
                     let p = if let Ask::Slug(_) = ask { by_slug[k as usize] } else { by_id[k as usize] };
-                    let status = match j.kind {
-                        Read::ArticleId { status, .. } => status,
-                        _ => 200,
+                    let (status, fav) = match j.kind {
+                        Read::ArticleId { status, fav, .. } => (status, fav),
+                        _ => (200, None),
                     };
                     let mut b = Vec::with_capacity(2048);
                     b.extend_from_slice(b"{\"article\":");
-                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false)) {
+                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false, fav)) {
                         b.push(b'}');
                         out.push(Response { to, status, body: b });
                     } else {
@@ -837,8 +841,8 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && auser.contains_key(&pa.i64(r[6]))).collect();
-                    list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
+                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[1].len >= 0 && auser.contains_key(&pa.i64(r[5]))).collect();
+                    list.sort_unstable_by(|x, y| (pa.i64(y[3]), pa.i64(y[1])).cmp(&(pa.i64(x[3]), pa.i64(x[1]))));
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
                     for (n, r) in list.into_iter().enumerate() {
@@ -846,16 +850,16 @@ impl ReadLane {
                             b.push(b',');
                         }
                         b.extend_from_slice(b"{\"id\":");
-                        json::int(&mut b, pa.i64(r[2]));
+                        json::int(&mut b, pa.i64(r[1]));
                         b.extend_from_slice(b",\"createdAt\":");
-                        json::ts(&mut b, pa.i64(r[4]));
+                        json::ts(&mut b, pa.i64(r[3]));
                         b.extend_from_slice(b",\"updatedAt\":");
-                        json::ts(&mut b, pa.i64(r[5]));
+                        json::ts(&mut b, pa.i64(r[4]));
                         b.extend_from_slice(b",\"body\":");
-                        json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
+                        json::str(&mut b, pa.bytes(r[2]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
-                        let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        let (u, pb) = (auser[&pa.i64(r[6])], pb.as_ref().unwrap());
+                        let following = v != 0 && ctx.following(v, pa.i64(r[5]));
+                        let (u, pb) = (auser[&pa.i64(r[5])], pb.as_ref().unwrap());
                         profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
@@ -879,7 +883,7 @@ impl ReadLane {
                         if !first {
                             b.push(b',');
                         }
-                        if ctx.article(&mut b, &pa, a, false, v, followed) {
+                        if ctx.article(&mut b, &pa, a, false, v, followed, None) {
                             first = false;
                         } else {
                             b.truncate(mark);
@@ -991,7 +995,7 @@ impl Ctx<'_> {
 
     /// Writes one Article object for viewer `v`, from the batch's fragment for it. Returns false (writing nothing)
     /// if the article's phase-B row is missing.
-    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64, followed: bool) -> bool {
+    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64, followed: bool, known_fav: Option<bool>) -> bool {
         let (id, author, _) = a;
         let mut f = self.frags.borrow_mut();
         let f = &mut *f;
@@ -1009,7 +1013,7 @@ impl Ctx<'_> {
         };
         let Some((start, fav, foll)) = at else { return false };
         b.extend_from_slice(&f.buf[start..fav]);
-        json::bool(b, v != 0 && self.favorited(v, id));
+        json::bool(b, known_fav.unwrap_or_else(|| v != 0 && self.favorited(v, id)));
         b.extend_from_slice(&f.buf[fav..foll]);
         json::bool(b, followed || (v != 0 && self.following(v, author)));
         b.extend_from_slice(b"}}");
@@ -1034,8 +1038,8 @@ fn write_plan(w: &WriteJob) -> Vec<&'static str> {
         Write::Follow { on: false, .. } => vec!["unfollow"],
         Write::Favorite { on: true, .. } => vec!["fav"],
         Write::Favorite { on: false, .. } => vec!["unfav"],
-        Write::CreateArticle { tags, .. } if tags.is_empty() => vec!["newart"],
-        Write::CreateArticle { .. } => vec!["newart", "newtags", "arttags"],
+        Write::CreateArticle { tags, .. } if tags.is_empty() => vec!["newart", "artout"],
+        Write::CreateArticle { .. } => vec!["newart", "newtags", "arttags", "artout"],
         Write::UpdateArticle { .. } => vec!["updart"],
         Write::DeleteArticle { .. } => vec!["delart"],
         Write::CreateComment { .. } => vec!["newcmt"],
@@ -1112,6 +1116,7 @@ fn bind_write(o: &mut pg::Out, w: &WriteJob) {
                 o.bind_exec("newtags", &[Param::Raw(&arr)]);
                 o.bind_exec("arttags", &[Param::Raw(&arr)]);
             }
+            o.bind_exec("artout", &[Param::I64(v)]);
         }
         Write::UpdateArticle { slug, title, description, body } => o.bind_exec(
             "updart",
@@ -1262,7 +1267,8 @@ fn finish_write(j: WriteJob, p: &Pipeline, start: usize, k: usize, s: &Settings,
         }
         return;
     }
-    finish_row(j, p, results[0].rows.first().map(|r| &r[..]), s, out);
+    let row = if matches!(j.kind, Write::CreateArticle { .. }) { k - 1 } else { 0 };
+    finish_row(j, p, results[row].rows.first().map(|r| &r[..]), s, out);
 }
 
 /// Answers a committed write from its first result row (None: no row).
@@ -1297,17 +1303,47 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
             }
             None => out.push(reply::error(to, 404, "profile not found")),
         },
-        Write::Favorite { .. } => match first {
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+        Write::Favorite { on, .. } => match first {
+            // The write just set the viewer's favorite state: the read-back needn't look it up again.
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200, fav: Some(on) }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
-        Write::CreateArticle { .. } => match first {
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 201 }, viewer: v, to }),
+        // A new article's whole response comes from the request and the "artout" row its own pipeline ends with: no
+        // favorites yet, so favorited is false and favoritesCount 0.
+        Write::CreateArticle { title, description, body, .. } => match first {
+            Some(r) => {
+                let mut b = Vec::with_capacity(1024 + body.len());
+                b.extend_from_slice(b"{\"article\":{\"slug\":");
+                json::str(&mut b, p.bytes(r[1]).unwrap_or(b""));
+                b.extend_from_slice(b",\"title\":");
+                json::str(&mut b, title.as_bytes());
+                b.extend_from_slice(b",\"description\":");
+                json::str(&mut b, description.as_bytes());
+                b.extend_from_slice(b",\"body\":");
+                json::str(&mut b, body.as_bytes());
+                b.extend_from_slice(b",\"tagList\":[");
+                if let Some(arr) = p.bytes(r[7]) {
+                    for (i, t) in pg::array_elems(arr).enumerate() {
+                        if i > 0 {
+                            b.push(b',');
+                        }
+                        json::str(&mut b, t);
+                    }
+                }
+                b.extend_from_slice(b"],\"createdAt\":");
+                json::ts(&mut b, p.i64(r[2]));
+                b.extend_from_slice(b",\"updatedAt\":");
+                json::ts(&mut b, p.i64(r[3]));
+                b.extend_from_slice(b",\"favorited\":false,\"favoritesCount\":0,\"author\":");
+                profile_obj(&mut b, p.bytes(r[4]).unwrap_or(b""), p.bytes(r[5]), p.bytes(r[6]), p.bytes(r[8]) == Some(&[1u8][..]));
+                b.extend_from_slice(b"}}");
+                out.push(Response { to, status: 201, body: b });
+            }
             None => out.push(reply::error(to, 500, "internal error")),
         },
         Write::UpdateArticle { .. } => match first {
             Some(r) if p.i64(r[1]) != v => out.push(reply::error(to, 403, "not the author")),
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200, fav: None }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::DeleteArticle { .. } => match first {

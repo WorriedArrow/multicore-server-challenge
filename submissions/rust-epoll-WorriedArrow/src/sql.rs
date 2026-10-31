@@ -58,7 +58,7 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         s(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id \
+            "SELECT r.k, c.id, c.body, c.created_at, c.updated_at, c.author_id \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
                WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
@@ -305,6 +305,16 @@ pub fn write_statements() -> Vec<Stmt> {
             "INSERT INTO article_tags (article_id, tag_id) \
              SELECT currval('articles_id_seq'::regclass), t.id FROM tags t WHERE t.name = ANY($1::text[])",
             &[TEXT_ARRAY],
+        ),
+        // A new article's response row, read in its own transaction after "newart" (and its tags): currval is the id
+        // that "newart" drew in this session.
+        s(
+            "artout",
+            "SELECT a.id, a.slug, a.created_at, a.updated_at, u.username, u.bio, u.image, \
+             ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
+             EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = $1) \
+             FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = currval('articles_id_seq'::regclass)",
+            &[crate::pg::INT8],
         ),
         s(
             "updart",
